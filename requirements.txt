@@ -19,3 +19,8 @@ uvicorn==0.52.1
 watchfiles==1.2.0
 websockets==16.1.1
 python-multipart==0.0.20
+alembic==1.16.5
+Mako==1.4.3
+psycopg==3.2.13
+psycopg-binary==3.2.13
+SQLAlchemy==2.0.54
