@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trip Mapper</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1d1d1b; --muted: #6b6a66; --line: #e3e1da; --card: #ffffff;
+    --accent: #0f6e56; --warn-bg: #faeeda; --warn-fg: #633806; --info-bg: #e6f1fb; --info-fg: #0c447c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a19; --fg: #ecebe6; --muted: #a09f99; --line: #34332f; --card: #232321;
+      --accent: #5dcaa5; --warn-bg: #412402; --warn-fg: #fac775; --info-bg: #042c53; --info-fg: #b5d4f4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 17px; font-weight: 600; margin: 32px 0 12px; }
+  .muted { color: var(--muted); }
+  section.panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button, input, select { font: inherit; }
+  button { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  input[type=number] { width: 70px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: middle; }
+  th { font-weight: 500; color: var(--muted); border-top: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+  figure { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  figure a { display: block; aspect-ratio: 1; background: var(--line); }
+  figure img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  figcaption { padding: 6px 8px; font-size: 13px; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 999px; margin: 2px 4px 0 0; }
+  .badge.guess { background: var(--warn-bg); color: var(--warn-fg); }
+  .badge.info { background: var(--info-bg); color: var(--info-fg); }
+  .noimg { display: flex; align-items: center; justify-content: center; height: 100%; font-size: 12px; color: var(--muted); padding: 8px; text-align: center; }
+  .error { color: #a32d2d; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Trip Mapper</h1>
+  <div class="muted" id="summary">Loading…</div>
+
+  <section class="panel">
+    <div class="row">
+      <input type="file" id="files" multiple accept="image/*,.heic,.heif">
+      <button class="primary" id="upload">Upload</button>
+      <span class="muted" id="upload-status"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <strong>Cameras</strong>
+    <span class="muted">— if a camera's clock was wrong, enter how far off it was to shift all its photos.</span>
+    <table id="cameras"></table>
+    <div id="offsets"></div>
+  </section>
+
+  <div id="timeline"></div>
+</main>
+
+<script>
+const SOURCE_LABELS = {
+  exif_offset: null,
+  gps: null,
+  coordinates: null,
+  neighbour: ["zone guessed from nearby photo", "guess"],
+  default_zone: ["zone unknown, default used", "guess"],
+};
+
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  for (const child of children) {
+    if (child != null) node.append(child);  // strings become text nodes, never HTML
+  }
+  return node;
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.status === 204 ? null : res.json();
+}
+
+function formatOffset(minutes) {
+  const sign = minutes < 0 ? "−" : "+";
+  const m = Math.abs(minutes);
+  return `UTC${sign}${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+function formatDay(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString(undefined, {
+    weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "UTC",
+  });
+}
+
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+function photoCard(p) {
+  const media = p.thumb_key
+    ? el("img", { src: `/photos/${p.id}/thumb`, loading: "lazy", alt: p.original_filename || "" })
+    : el("div", { class: "noimg" }, p.processing_error ? "Can't preview this file" : "No preview");
+  const link = el("a", { href: p.web_key ? `/photos/${p.id}/web` : `/photos/${p.id}`, target: "_blank" }, media);
+
+  const caption = el("figcaption");
+  if (p.local_time) {
+    const time = p.local_time.slice(11, 16);
+    const zone = p.tz_name || formatOffset(p.local_offset_min);
+    caption.append(el("div", {}, el("strong", {}, time), " ", el("span", { class: "muted" }, zone)));
+  }
+  caption.append(el("div", { class: "muted" }, p.original_filename || "(no name)"));
+  const label = SOURCE_LABELS[p.time_source];
+  if (label) caption.append(el("span", { class: `badge ${label[1]}` }, label[0]));
+  if (p.shot_at && p.lat == null) caption.append(el("span", { class: "badge info" }, "no GPS"));
+  if (p.camera_model) caption.append(el("div", { class: "muted" }, p.camera_model));
+  return el("figure", {}, link, caption);
+}
+
+async function renderTimeline() {
+  const data = await api("/timeline");
+  const root = document.getElementById("timeline");
+  root.replaceChildren();
+  let total = data.undated.length;
+  for (const day of data.days) {
+    total += day.photos.length;
+    root.append(
+      el("h2", {}, formatDay(day.date), " ", el("span", { class: "muted" }, `· ${plural(day.photos.length, "photo")}`)),
+      el("div", { class: "grid" }, ...day.photos.map(photoCard)),
+    );
+  }
+  if (data.undated.length) {
+    root.append(
+      el("h2", {}, "Undated ", el("span", { class: "muted" }, `· ${plural(data.undated.length, "photo")} with no time information`)),
+      el("div", { class: "grid" }, ...data.undated.map(photoCard)),
+    );
+  }
+  document.getElementById("summary").textContent =
+    total ? `${plural(total, "photo")} across ${plural(data.days.length, "day")}` : "No photos yet — upload some below.";
+}
+
+async function renderCameras() {
+  const [cameras, offsets] = await Promise.all([api("/cameras"), api("/camera-offsets")]);
+  const table = document.getElementById("cameras");
+  table.replaceChildren(el("tr", {}, el("th", {}, "Camera"), el("th", {}, "Photos"), el("th", {}, "Clock was off by")));
+  for (const c of cameras) {
+    const hours = el("input", { type: "number", value: "0", step: "1", "aria-label": "hours" });
+    const minutes = el("input", { type: "number", value: "0", step: "1", "aria-label": "minutes" });
+    const direction = el("select", { "aria-label": "direction" },
+      el("option", { value: "1" }, "behind (add time)"),
+      el("option", { value: "-1" }, "ahead (subtract time)"));
+    const apply = el("button", {
+      onclick: async () => {
+        const seconds = Number(direction.value) * (Number(hours.value) * 3600 + Number(minutes.value) * 60);
+        if (!seconds) return;
+        const existing = offsets.filter(o =>
+          o.camera_make === c.camera_make && o.camera_model === c.camera_model &&
+          o.camera_serial === c.camera_serial);
+        if (existing.length && !confirm("Replace this camera's existing clock correction?")) return;
+        try {
+          for (const o of existing) await api(`/camera-offsets/${o.id}`, { method: "DELETE" });
+          await api("/camera-offsets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              camera_make: c.camera_make, camera_model: c.camera_model,
+              camera_serial: c.camera_serial, offset_seconds: seconds,
+            }),
+          });
+          await refresh();
+        } catch (e) { alert(e.message); }
+      },
+    }, "Apply");
+    const name = [c.camera_make, c.camera_model].join(" ") + (c.camera_serial ? ` (#${c.camera_serial})` : "");
+    table.append(el("tr", {},
+      el("td", {}, name),
+      el("td", {}, String(c.photo_count)),
+      el("td", {}, el("div", { class: "row" }, hours, "h", minutes, "m", direction, apply)),
+    ));
+  }
+  if (!cameras.length) table.append(el("tr", {}, el("td", { class: "muted" }, "No camera information yet.")));
+
+  const list = document.getElementById("offsets");
+  list.replaceChildren();
+  for (const o of offsets) {
+    const sign = o.offset_seconds >= 0 ? "+" : "−";
+    const abs = Math.abs(o.offset_seconds);
+    const text = `${o.camera_make} ${o.camera_model}: ${sign}${Math.floor(abs / 3600)}h ${Math.floor(abs % 3600 / 60)}m applied`;
+    list.append(el("div", { class: "row" }, el("span", { class: "muted" }, text),
+      el("button", { onclick: async () => { await api(`/camera-offsets/${o.id}`, { method: "DELETE" }); await refresh(); } }, "Remove")));
+  }
+}
+
+async function refresh() {
+  try {
+    await Promise.all([renderTimeline(), renderCameras()]);
+  } catch (e) {
+    document.getElementById("summary").replaceChildren(el("span", { class: "error" }, `Failed to load: ${e.message}`));
+  }
+}
+
+document.getElementById("upload").addEventListener("click", async () => {
+  const files = [...document.getElementById("files").files];
+  const status = document.getElementById("upload-status");
+  let failed = 0;
+  for (const [i, file] of files.entries()) {
+    status.textContent = `Uploading ${i + 1} of ${files.length}…`;
+    const form = new FormData();
+    form.append("file", file);
+    try { await api("/photos", { method: "POST", body: form }); } catch { failed++; }
+  }
+  status.textContent = files.length ? `Done: ${files.length - failed} uploaded${failed ? `, ${failed} failed` : ""}.` : "";
+  await refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>
