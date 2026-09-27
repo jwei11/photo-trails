@@ -42,7 +42,7 @@ def test_timeline_days_are_in_date_order_across_the_date_line(client):
     upload(client, "tokyo.jpg", jpeg("2025:07:02 09:00:00", "+09:00", 35.68, 139.69))
     upload(client, "honolulu.jpg", jpeg("2025:07:01 16:00:00", "-10:00", 21.31, -157.86))
 
-    days = client.get("/timeline").json()["days"]
+    days = client.get("/timeline").json()["not_in_trip"]  # 2 photos: too few for a trip
 
     assert [d["date"] for d in days] == ["2025-07-01", "2025-07-02"]
     assert [p["original_filename"] for d in days for p in d["photos"]] == ["honolulu.jpg", "tokyo.jpg"]

@@ -32,6 +32,6 @@ def client(migrated_db):
     from app.main import app
 
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE photos, camera_clock_offsets"))
+        conn.execute(text("TRUNCATE photos, camera_clock_offsets, trips, homes"))
     with TestClient(app) as c:
         yield c

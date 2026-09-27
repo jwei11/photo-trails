@@ -40,6 +40,14 @@
   .badge.info { background: var(--info-bg); color: var(--info-fg); }
   .noimg { display: flex; align-items: center; justify-content: center; height: 100%; font-size: 12px; color: var(--muted); padding: 8px; text-align: center; }
   .error { color: #a32d2d; }
+  h3 { font-size: 14px; font-weight: 600; margin: 20px 0 8px; }
+  section.trip { margin-top: 32px; padding-top: 8px; border-top: 2px solid var(--accent); }
+  section.trip.loose { border-top-color: var(--line); }
+  section.trip h2 { margin: 8px 0 2px; }
+  .trip-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  .actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+  button.small, select.small { font-size: 12px; padding: 2px 6px; }
+  input:not([type=number]):not([type=file]) { padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
 </style>
 </head>
 <body>
@@ -60,6 +68,19 @@
     <span class="muted">— if a camera's clock was wrong, enter how far off it was to shift all its photos.</span>
     <table id="cameras"></table>
     <div id="offsets"></div>
+  </section>
+
+  <section class="panel">
+    <strong>Homes</strong>
+    <span class="muted">— photos near a home aren't counted as trips. Get coordinates from a map app (e.g. right-click a spot in Google Maps).</span>
+    <div id="homes"></div>
+    <form id="home-form" class="row" style="margin-top: 8px">
+      <input name="name" placeholder="Name, e.g. Parents' house" required maxlength="100">
+      <input name="coords" placeholder="37.7749, -122.4194" required>
+      <label class="muted">within <input name="radius" type="number" value="25" min="1" max="500" step="1"> km</label>
+      <button class="primary">Add home</button>
+      <span class="error" id="home-error"></span>
+    </form>
   </section>
 
   <div id="timeline"></div>
@@ -110,7 +131,22 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-function photoCard(p) {
+async function act(fn) {
+  try { await fn(); await refresh(); } catch (e) { alert(e.message); }
+}
+
+function json(method, body) {
+  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+}
+
+function formatRange(startIso, endIso) {
+  const opts = { month: "short", day: "numeric", year: "numeric" };
+  const start = new Date(startIso).toLocaleDateString(undefined, opts);
+  const end = new Date(endIso).toLocaleDateString(undefined, opts);
+  return start === end ? start : `${start} – ${end}`;
+}
+
+function photoCard(p, actions = []) {
   const media = p.thumb_key
     ? el("img", { src: `/photos/${p.id}/thumb`, loading: "lazy", alt: p.original_filename || "" })
     : el("div", { class: "noimg" }, p.processing_error ? "Can't preview this file" : "No preview");
@@ -127,30 +163,125 @@ function photoCard(p) {
   if (label) caption.append(el("span", { class: `badge ${label[1]}` }, label[0]));
   if (p.shot_at && p.lat == null) caption.append(el("span", { class: "badge info" }, "no GPS"));
   if (p.camera_model) caption.append(el("div", { class: "muted" }, p.camera_model));
+  if (actions.length) caption.append(el("div", { class: "actions" }, ...actions));
   return el("figure", {}, link, caption);
+}
+
+function smallButton(label, onclick, title) {
+  return el("button", { class: "small", onclick, title: title || label }, label);
+}
+
+function addToTripSelect(p, trips) {
+  if (!trips.length) return null;
+  const select = el("select", { class: "small", "aria-label": "Add to trip",
+    onchange: () => act(() => api(`/photos/${p.id}/trip`, json("PUT", { trip_id: select.value }))) },
+    el("option", { value: "" }, "Add to trip…"),
+    ...trips.map(t => el("option", { value: t.id }, t.name || formatRange(t.start, t.end))));
+  return select;
+}
+
+function dayBlocks(days, cardFor) {
+  return days.flatMap(day => [
+    el("h3", {}, formatDay(day.date), " ", el("span", { class: "muted" }, `· ${plural(day.photos.length, "photo")}`)),
+    el("div", { class: "grid" }, ...day.photos.map(cardFor)),
+  ]);
+}
+
+function tripSection(trip, next, allTrips) {
+  const title = trip.name || formatRange(trip.start, trip.end);
+  const stats = [
+    trip.name ? formatRange(trip.start, trip.end) : null,
+    plural(trip.day_count, "day"),
+    plural(trip.photo_count, "photo"),
+    trip.distance_km ? `${Math.round(trip.distance_km).toLocaleString()} km` : null,
+  ].filter(Boolean).join(" · ");
+
+  const buttons = [
+    smallButton("Rename", () => {
+      const name = prompt("Trip name (leave empty to use the dates):", trip.name || "");
+      if (name === null) return;
+      act(() => api(`/trips/${trip.id}`, json("PATCH", { name: name.trim() || null })));
+    }),
+    next ? smallButton("Merge with next", () => act(() =>
+      api(`/trips/${trip.id}/merge`, json("POST", { trip_ids: [next.id] }))),
+      `Merge "${next.name || formatRange(next.start, next.end)}" into this trip`) : null,
+    smallButton("Not a trip", () => {
+      if (confirm("Take all these photos out of trips? They won't be regrouped automatically."))
+        act(() => api(`/trips/${trip.id}`, { method: "DELETE" }));
+    }),
+  ];
+
+  const firstId = trip.days[0]?.photos[0]?.id;
+  const cardFor = p => photoCard(p, [
+    p.id !== firstId ? smallButton("Split here", () => act(() =>
+      api(`/trips/${trip.id}/split`, json("POST", { at: p.shot_at }))),
+      "Start a new trip from this photo") : null,
+    smallButton("Remove", () => act(() => api(`/photos/${p.id}/trip`, json("PUT", { trip_id: null }))),
+      "Take this photo out of the trip"),
+  ].filter(Boolean));
+
+  return el("section", { class: "trip" },
+    el("div", { class: "trip-head" },
+      el("div", {},
+        el("h2", {}, title, " ", trip.is_locked ? el("span", { class: "badge info" }, "edited") : null),
+        el("div", { class: "muted" }, stats)),
+      el("div", { class: "row" }, ...buttons.filter(Boolean))),
+    ...dayBlocks(trip.days, cardFor),
+    ...(trip.undated.length ? [el("h3", {}, "Undated"), el("div", { class: "grid" }, ...trip.undated.map(cardFor))] : []),
+  );
 }
 
 async function renderTimeline() {
   const data = await api("/timeline");
   const root = document.getElementById("timeline");
   root.replaceChildren();
-  let total = data.undated.length;
-  for (const day of data.days) {
-    total += day.photos.length;
-    root.append(
-      el("h2", {}, formatDay(day.date), " ", el("span", { class: "muted" }, `· ${plural(day.photos.length, "photo")}`)),
-      el("div", { class: "grid" }, ...day.photos.map(photoCard)),
-    );
+  const trips = data.trips;
+  const looseCard = p => photoCard(p, [addToTripSelect(p, trips)].filter(Boolean));
+
+  trips.forEach((trip, i) => root.append(tripSection(trip, trips[i + 1], trips)));
+
+  const loose = data.not_in_trip.reduce((n, d) => n + d.photos.length, 0);
+  if (loose) {
+    root.append(el("section", { class: "trip loose" },
+      el("h2", {}, "Not in a trip ", el("span", { class: "muted" }, `· ${plural(loose, "photo")} at home, in small groups, or removed`)),
+      ...dayBlocks(data.not_in_trip, looseCard)));
   }
   if (data.undated.length) {
-    root.append(
+    root.append(el("section", { class: "trip loose" },
       el("h2", {}, "Undated ", el("span", { class: "muted" }, `· ${plural(data.undated.length, "photo")} with no time information`)),
-      el("div", { class: "grid" }, ...data.undated.map(photoCard)),
-    );
+      el("div", { class: "grid" }, ...data.undated.map(looseCard))));
   }
-  document.getElementById("summary").textContent =
-    total ? `${plural(total, "photo")} across ${plural(data.days.length, "day")}` : "No photos yet — upload some below.";
+
+  const inTrips = trips.reduce((n, t) => n + t.photo_count, 0);
+  const total = inTrips + loose + data.undated.length;
+  document.getElementById("summary").textContent = total
+    ? `${plural(total, "photo")} · ${plural(trips.length, "trip")}`
+    : "No photos yet — upload some below.";
 }
+
+async function renderHomes() {
+  const homes = await api("/homes");
+  const list = document.getElementById("homes");
+  list.replaceChildren(...homes.map(h => el("div", { class: "row" },
+    el("span", {}, `${h.name}: ${h.lat.toFixed(4)}, ${h.lon.toFixed(4)} (within ${h.radius_km} km)`),
+    smallButton("Remove", () => act(() => api(`/homes/${h.id}`, { method: "DELETE" }))))));
+  if (!homes.length) list.append(el("div", { class: "muted" }, "No home set: photos taken at home may be grouped into trips."));
+}
+
+document.getElementById("home-form").addEventListener("submit", e => {
+  e.preventDefault();
+  const form = e.target;
+  const [lat, lon] = form.coords.value.split(",").map(s => Number(s.trim()));
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    document.getElementById("home-error").textContent = "Enter coordinates as: latitude, longitude";
+    return;
+  }
+  document.getElementById("home-error").textContent = "";
+  act(async () => {
+    await api("/homes", json("POST", { name: form.name.value.trim(), lat, lon, radius_km: Number(form.radius.value) }));
+    form.reset();
+  });
+});
 
 async function renderCameras() {
   const [cameras, offsets] = await Promise.all([api("/cameras"), api("/camera-offsets")]);
@@ -206,7 +337,7 @@ async function renderCameras() {
 
 async function refresh() {
   try {
-    await Promise.all([renderTimeline(), renderCameras()]);
+    await Promise.all([renderTimeline(), renderCameras(), renderHomes()]);
   } catch (e) {
     document.getElementById("summary").replaceChildren(el("span", { class: "error" }, `Failed to load: ${e.message}`));
   }

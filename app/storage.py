@@ -8,7 +8,7 @@ import psycopg
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from app import images, timeresolve, tz
+from app import images, timeresolve, trips, tz
 from app.config import DEFAULT_TIMEZONE, UPLOAD_DIR
 from app.db import engine
 
@@ -19,10 +19,24 @@ PHOTO_COLUMNS = """
     camera_make, camera_model, camera_serial, camera_time, exif_offset_min, gps_time,
     lat, lon, altitude_m, width, height, orientation,
     shot_at, tz_name, local_offset_min, time_source,
-    thumb_key, web_key, processing_error, processing_ms
+    thumb_key, web_key, processing_error, processing_ms, trip_id, trip_pinned
 """
 
-TIME_RESOLUTION_LOCK = 3_141_592
+WRITE_LOCK = 3_141_592
+
+
+def lock_writes(conn: Connection) -> None:
+    """Serialize write transactions. Call first, before reading anything the write depends on.
+
+    Every write ends by recomputing times and trips from the whole photo set, so two writes
+    running at once could each compute from a stale view and overwrite the other's result.
+    """
+    conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": WRITE_LOCK})
+
+
+def recompute(conn: Connection) -> None:
+    resolve_times(conn)
+    regroup_trips(conn)
 
 
 def file_path(storage_key: str) -> Path:
@@ -62,6 +76,7 @@ def add_photo(original_filename: str | None, content_type: str, contents: bytes)
 
     meta = processed.metadata if processed else None
     with engine.begin() as conn:
+        lock_writes(conn)
         row = conn.execute(
             text(
                 """
@@ -112,7 +127,7 @@ def add_photo(original_filename: str | None, content_type: str, contents: bytes)
         if processed:
             file_path(row.thumb_key).write_bytes(processed.thumb)
             file_path(row.web_key).write_bytes(processed.web)
-        resolve_times(conn)
+        recompute(conn)
 
     total_ms = round((time.perf_counter() - started) * 1000)
     log.info(
@@ -123,9 +138,6 @@ def add_photo(original_filename: str | None, content_type: str, contents: bytes)
 
 
 def resolve_times(conn: Connection) -> int:
-    # Serialize: two concurrent resolutions would each overwrite the other's results.
-    conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": TIME_RESOLUTION_LOCK})
-
     rows = conn.execute(
         text(
             """
@@ -178,6 +190,62 @@ def resolve_times(conn: Connection) -> int:
     return len(changed)
 
 
+def regroup_trips(conn: Connection) -> None:
+    rows = conn.execute(
+        text(
+            """
+            SELECT p.id, p.shot_at, p.lat, p.lon, p.trip_id,
+                   p.trip_pinned OR coalesce(t.is_locked, false) AS pinned
+            FROM photos p LEFT JOIN trips t ON t.id = p.trip_id
+            """
+        )
+    ).all()
+    locked = [
+        trips.LockedTrip(str(r.id), r.start, r.end)
+        for r in conn.execute(
+            text(
+                """
+                SELECT t.id, min(p.shot_at) AS start, max(p.shot_at) AS end
+                FROM trips t JOIN photos p ON p.trip_id = t.id
+                WHERE t.is_locked AND p.shot_at IS NOT NULL
+                GROUP BY t.id
+                """
+            )
+        )
+    ]
+    homes = [
+        trips.Home(r.lat, r.lon, r.radius_km)
+        for r in conn.execute(text("SELECT lat, lon, radius_km FROM homes"))
+    ]
+    grouping = trips.group_photos(
+        (
+            trips.TripPhoto(
+                str(r.id), r.shot_at, r.lat, r.lon,
+                str(r.trip_id) if r.trip_id else None, r.pinned,
+            )
+            for r in rows
+        ),
+        homes,
+        locked,
+    )
+
+    new_ids = {
+        ref: str(conn.execute(text("INSERT INTO trips DEFAULT VALUES RETURNING id")).scalar_one())
+        for ref in grouping.new_trips
+    }
+    current = {str(r.id): (str(r.trip_id) if r.trip_id else None) for r in rows}
+    changes = [
+        {"id": pid, "trip_id": new_ids.get(trip, trip)}
+        for pid, trip in grouping.assignments.items()
+        if new_ids.get(trip, trip) != current[pid]
+    ]
+    if changes:
+        conn.execute(text("UPDATE photos SET trip_id = :trip_id WHERE id = :id"), changes)
+    conn.execute(
+        text("DELETE FROM trips t WHERE NOT EXISTS (SELECT 1 FROM photos p WHERE p.trip_id = t.id)")
+    )
+
+
 def list_cameras() -> list[dict]:
     with engine.connect() as conn:
         rows = conn.execute(
@@ -208,6 +276,7 @@ class OffsetOverlapError(Exception):
 def add_offset(values: dict) -> dict:
     try:
         with engine.begin() as conn:
+            lock_writes(conn)
             row = conn.execute(
                 text(
                     """
@@ -222,6 +291,7 @@ def add_offset(values: dict) -> dict:
                 values,
             ).one()
             changed = resolve_times(conn)
+            regroup_trips(conn)
     except IntegrityError as exc:
         if isinstance(exc.orig, psycopg.errors.ExclusionViolation):
             raise OffsetOverlapError from exc
@@ -231,9 +301,12 @@ def add_offset(values: dict) -> dict:
 
 def delete_offset(offset_id: str) -> int | None:
     with engine.begin() as conn:
+        lock_writes(conn)
         deleted = conn.execute(
             text("DELETE FROM camera_clock_offsets WHERE id = :id"), {"id": offset_id}
         ).rowcount
         if not deleted:
             return None
-        return resolve_times(conn)
+        changed = resolve_times(conn)
+        regroup_trips(conn)
+        return changed
