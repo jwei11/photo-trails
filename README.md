@@ -6,7 +6,7 @@ Drop in the photos from a trip. It reads the timestamps and GPS out of them, wor
 
 ```bash
 cp .env.example .env            # then set a real password
-docker compose up -d --wait db  # Postgres + PostGIS (builds the image on first run)
+docker compose up -d --wait db objects  # Postgres + PostGIS, and S3-compatible storage
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/alembic upgrade head  # apply migrations
 .venv/bin/uvicorn app.main:app --reload
@@ -16,7 +16,7 @@ Open http://localhost:8000 for the timeline, or http://localhost:8000/docs for t
 
 Run the tests: `.venv/bin/python -m pytest`. The API tests need their own database, because they wipe it. Create it once with `docker compose exec db sh -c 'createdb -U $POSTGRES_USER trips_test'` and set `TEST_DATABASE_URL` in `.env`. Without it, those tests are skipped.
 
-Reset the database from scratch: `docker compose down -v && docker compose up -d db && .venv/bin/alembic upgrade head`
+Reset all data from scratch (database and stored photos): `docker compose down -v && docker compose up -d --wait db objects && .venv/bin/alembic upgrade head`
 
 ## How a photo gets its time
 
@@ -92,6 +92,12 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Undecodable files are stored, not rejected.** RAW files, videos, and corrupt uploads are kept as originals with `processing_error` set. They aren't lost, and they can be reprocessed if support is added.
 
+**Photos live in S3-compatible object storage, run locally with SeaweedFS.** Local disk ties files to one machine: a second API server, a worker (M8), or a redeploy can't see them. All storage goes through boto3 (the AWS SDK), so production can use Amazon S3, Cloudflare R2, or DigitalOcean Spaces by changing the endpoint and credentials. The guide suggests MinIO, but MinIO stopped publishing images in 2025. SeaweedFS is maintained and supports everything used here (presigned URLs with signed headers, CORS). It only publishes a moving `latest` tag, so compose pins the image by digest. Rejected: Garage (more setup steps before first use) and building MinIO from source (we'd own security updates for an abandoned image).
+
+**Images are served by redirecting to short-lived signed URLs.** `GET /photos/{id}/thumb` returns `302` to a presigned bucket URL valid for an hour, so image bytes never pass through the API and the bucket stays private. Signed URLs differ on every request, which defeats browser caching, so the redirect itself is cacheable (`Cache-Control: private, max-age=3000`): repeat views reuse the same URL and hit the browser's image cache. Rejected: streaming through the API (every image view loads the API) and a public bucket (originals include GPS, and anyone with a URL could see them forever).
+
+**Two S3 endpoints: one the API uses, one baked into signed URLs.** A presigned URL's signature covers its hostname. Once the API runs in Docker (M10), it reaches storage at an internal name (`objects:8333`) that browsers can't resolve, while browsers need `localhost:8333` or a public domain. Signing with the internal client would produce URLs that are valid but unreachable. `S3_ENDPOINT` and `S3_PUBLIC_ENDPOINT` are the same today, and configured separately from the start.
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -119,11 +125,21 @@ What this shows:
 - **The server stays responsive** during processing, because it runs on the thread pool, not the event loop.
 - Even at best, the client waits ~25s for a trip, with the work tied to open HTTP requests: if the browser tab closes, unprocessed photos are lost. M8's background worker decouples the two.
 
+**M5 pass A: uploads through the API into object storage** (40 × 12-megapixel phone JPEGs, 119MB):
+
+| Upload pattern | Wall time | Per request (mean) |
+|---|---|---|
+| One at a time | 20.7s | 497ms |
+| 4 at a time | 9.3s | 876ms |
+
+That's about 90ms more per photo than local disk (~410ms): three network writes (original, thumbnail, web copy) instead of three file writes. The first run after starting SeaweedFS was ~3× slower (58.5s) while it created storage volumes on first use, so benchmarks are taken warm.
+
 ## Known gaps
 
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
-- Files live on local disk. If the commit fails after the file is written, the file is orphaned. Object storage (M5) and a cleanup job address this.
-- Uploads are read fully into memory. Presigned URLs (M5) fix this.
+- If the database commit fails after the objects are written, the objects are orphaned (the dual-write problem). A cleanup job addresses this.
+- Uploads pass through the API and are read fully into memory. Presigned URLs (M5 pass B) fix this.
+- SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them. The app sets an explicit CORS rule for `APP_ORIGIN` on startup, so production behaves correctly, but locally the permissive default hides mistakes in that rule.
 - RAW files and video aren't decoded: they're stored, with no metadata or previews.
 - A wall-clock time in the repeated hour when clocks fall back is ambiguous. We take the first occurrence. Only a recorded offset or GPS time can disambiguate it.
 - Some cameras write a stale GPS timestamp (from the last fix, not the shot), so `gps` is trusted below the recorded offset.

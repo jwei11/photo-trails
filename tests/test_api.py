@@ -1,5 +1,6 @@
 import io
 
+import httpx
 from PIL import Image, TiffImagePlugin
 
 from app.exif import IFD_EXIF, IFD_GPS
@@ -35,6 +36,21 @@ def upload(client, name: str, data: bytes):
 
 def add_offset(client, **overrides):
     return client.post("/camera-offsets", json={**FUJI, "offset_seconds": 3600, **overrides})
+
+
+def test_files_are_served_by_redirect_to_signed_bucket_urls(client):
+    data = jpeg("2025:07:01 10:00:00", "+01:00", 38.72, -9.14)
+    photo = upload(client, "a.jpg", data)
+
+    for path, expected_type in [("", "image/jpeg"), ("/thumb", "image/webp"), ("/web", "image/webp")]:
+        res = client.get(f"/photos/{photo['id']}{path}", follow_redirects=False)
+        assert res.status_code == 302
+        assert "X-Amz-Signature=" in res.headers["location"]
+        assert res.headers["cache-control"].startswith("private")
+        fetched = httpx.get(res.headers["location"])
+        assert fetched.status_code == 200
+        assert fetched.headers["content-type"] == expected_type
+    assert httpx.get(client.get(f"/photos/{photo['id']}", follow_redirects=False).headers["location"]).content == data
 
 
 def test_timeline_days_are_in_date_order_across_the_date_line(client):

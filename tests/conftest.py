@@ -1,5 +1,4 @@
 import os
-import tempfile
 
 import pytest
 from dotenv import load_dotenv
@@ -10,7 +9,7 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 # Must happen before app.config is imported, so the app never points at the real database.
 if TEST_DATABASE_URL:
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
-    os.environ["UPLOAD_DIR"] = tempfile.mkdtemp(prefix="trip-mapper-test-")
+    os.environ["S3_BUCKET"] = os.environ.get("TEST_S3_BUCKET", "photos-test")
 
 
 @pytest.fixture(scope="session")

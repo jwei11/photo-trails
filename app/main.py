@@ -3,19 +3,26 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 
-from app import storage, trip_store
-from app.config import UPLOAD_DIR
+from app import objects, storage, trip_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-app = FastAPI()
 
-UPLOAD_DIR.mkdir(exist_ok=True)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await run_in_threadpool(objects.ensure_bucket)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -50,10 +57,20 @@ def _photo_or_404(photo_id: uuid.UUID, include_exif: bool = False) -> dict:
     return record
 
 
+def _redirect_to_object(key: str) -> RedirectResponse:
+    # The signed URL is valid for an hour; let the browser reuse this redirect for most of
+    # that, so repeat views skip the API and hit its image cache instead.
+    max_age = objects.DOWNLOAD_URL_TTL - 600
+    return RedirectResponse(
+        objects.download_url(key),
+        status_code=302,
+        headers={"Cache-Control": f"private, max-age={max_age}"},
+    )
+
+
 @app.get("/photos/{photo_id}")
 def get_photo_file(photo_id: uuid.UUID):
-    record = _photo_or_404(photo_id)
-    return FileResponse(storage.file_path(record["storage_key"]), media_type=record["content_type"])
+    return _redirect_to_object(_photo_or_404(photo_id)["storage_key"])
 
 
 @app.get("/photos/{photo_id}/metadata")
@@ -75,11 +92,7 @@ def _derivative(photo_id: uuid.UUID, key: str):
     record = _photo_or_404(photo_id)
     if record[key] is None:
         raise HTTPException(status_code=404, detail="No preview for this file")
-    return FileResponse(
-        storage.file_path(record[key]),
-        media_type="image/webp",
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
-    )
+    return _redirect_to_object(record[key])
 
 
 def _by_local_day(photos: list[dict]) -> list[dict]:

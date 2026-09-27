@@ -8,8 +8,8 @@ import psycopg
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from app import images, timeresolve, trips, tz
-from app.config import DEFAULT_TIMEZONE, UPLOAD_DIR
+from app import images, objects, timeresolve, trips, tz
+from app.config import DEFAULT_TIMEZONE
 from app.db import engine
 
 log = logging.getLogger(__name__)
@@ -37,10 +37,6 @@ def lock_writes(conn: Connection) -> None:
 def recompute(conn: Connection) -> None:
     resolve_times(conn)
     regroup_trips(conn)
-
-
-def file_path(storage_key: str) -> Path:
-    return UPLOAD_DIR / storage_key
 
 
 def all_photos() -> list[dict]:
@@ -123,10 +119,10 @@ def add_photo(original_filename: str | None, content_type: str, contents: bytes)
             },
         ).one()
 
-        file_path(row.storage_key).write_bytes(contents)
+        objects.put(row.storage_key, contents, content_type)
         if processed:
-            file_path(row.thumb_key).write_bytes(processed.thumb)
-            file_path(row.web_key).write_bytes(processed.web)
+            objects.put(row.thumb_key, processed.thumb, "image/webp")
+            objects.put(row.web_key, processed.web, "image/webp")
         recompute(conn)
 
     total_ms = round((time.perf_counter() - started) * 1000)
