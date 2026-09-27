@@ -45,6 +45,39 @@ async def upload_photo(file: UploadFile):
     )
 
 
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+
+class UploadRequest(BaseModel):
+    filename: str | None = Field(default=None, max_length=255)
+    content_type: str = Field(pattern=r"^[\w.+-]+/[\w.+-]+$", max_length=100)
+    size_bytes: int = Field(gt=0, le=MAX_UPLOAD_BYTES)
+
+
+@app.post("/uploads", status_code=201)
+def request_upload(body: UploadRequest):
+    """Step 1 of 3: get a signed URL to PUT the file straight into storage."""
+    pending = storage.create_pending(body.filename, body.content_type, body.size_bytes)
+    return {
+        "photo_id": pending["id"],
+        "upload_url": objects.upload_url(pending["storage_key"], body.content_type, body.size_bytes),
+        "method": "PUT",
+        "headers": {"Content-Type": body.content_type},
+        "expires_in": objects.UPLOAD_URL_TTL,
+    }
+
+
+@app.post("/uploads/{photo_id}/complete")
+def complete_upload(photo_id: uuid.UUID):
+    """Step 3 of 3: after the PUT succeeds, process the photo. Safe to retry."""
+    try:
+        return storage.complete_upload(str(photo_id))
+    except storage.UploadNotFound:
+        raise HTTPException(status_code=404, detail="Upload not found or expired")
+    except storage.UploadNotReceived:
+        raise HTTPException(status_code=409, detail="The file hasn't been uploaded yet")
+
+
 @app.get("/photos")
 def list_photos():
     return storage.all_photos()

@@ -96,6 +96,14 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Images are served by redirecting to short-lived signed URLs.** `GET /photos/{id}/thumb` returns `302` to a presigned bucket URL valid for an hour, so image bytes never pass through the API and the bucket stays private. Signed URLs differ on every request, which defeats browser caching, so the redirect itself is cacheable (`Cache-Control: private, max-age=3000`): repeat views reuse the same URL and hit the browser's image cache. Rejected: streaming through the API (every image view loads the API) and a public bucket (originals include GPS, and anyone with a URL could see them forever).
 
+**Uploads go straight from the browser to storage (presigned PUT).** The browser asks for an upload URL (`POST /uploads` with filename, type, and size), PUTs the file directly to the bucket, then calls `POST /uploads/{id}/complete`. The API never holds file bytes during transfer, so slow client connections tie up the bucket instead of API workers. Size and content type are part of the URL's signature, so the bucket rejects any other file (tested). Rejected: presigned POST with a policy (more flexible limits, but a multipart form, and support varies more across S3-compatible stores). `POST /photos` still accepts a direct upload for scripts and tests, and runs the same steps internally.
+
+**Photos are `pending` until completed, and completion is idempotent.** A row is created when the URL is issued, so the storage key exists before the file does. Pending photos are invisible everywhere else. `complete` can be retried safely: it returns the existing photo if already done, derivative keys depend only on the photo ID so a retry overwrites instead of duplicating, and the status is re-checked under the write lock so two concurrent completions don't both finish.
+
+**Orphans are swept by `python -m app.cleanup`.** It deletes pending uploads never completed within an hour, plus bucket objects no row references (left by a failed commit: the dual-write gap). The one-hour threshold is well beyond the 15-minute upload URL lifetime, so the sweep never races an upload or completion still in progress. The delete re-checks `status = 'pending'`, so a completion that lands between the sweep's read and delete isn't lost. `--dry-run` reports without deleting. For now it's run by hand; M8's worker will schedule it.
+
+**Each timestamp is compared against the clock that wrote it.** The sweep first compared the database's `created_at` against a cutoff from the app's clock, and a test failed intermittently: the Docker VM's clock runs ~40ms ahead of the host's, so a just-created row looked newer than "now". Row cutoffs are now computed in SQL with the database's `now()`. Bucket timestamps come from the store's clock; with a one-hour threshold, millisecond skew is irrelevant.
+
 **Two S3 endpoints: one the API uses, one baked into signed URLs.** A presigned URL's signature covers its hostname. Once the API runs in Docker (M10), it reaches storage at an internal name (`objects:8333`) that browsers can't resolve, while browsers need `localhost:8333` or a public domain. Signing with the internal client would produce URLs that are valid but unreachable. `S3_ENDPOINT` and `S3_PUBLIC_ENDPOINT` are the same today, and configured separately from the start.
 
 ## Performance baseline (M3, synchronous processing)
@@ -134,11 +142,21 @@ What this shows:
 
 That's about 90ms more per photo than local disk (~410ms): three network writes (original, thumbnail, web copy) instead of three file writes. The first run after starting SeaweedFS was ~3× slower (58.5s) while it created storage volumes on first use, so benchmarks are taken warm.
 
+**M5 pass B: presigned direct uploads** (same 40 photos, same session as a pass A re-run):
+
+| Upload pattern | Pass A (through API) | Pass B (direct) | Pass B per photo: URL / PUT / complete |
+|---|---|---|---|
+| One at a time | 22.0s | 23.1s | 10ms / 67ms / 483ms |
+| 4 at a time | 9.3s | 7.1s | 12ms / 82ms / 567ms |
+
+On one machine, pass B isn't faster one at a time: moving 3MB over loopback takes ~70ms, and `complete` still downloads the original and processes it inline. The win is where the transfer time goes. Over a 10 Mbps home connection, a 3MB upload takes ~2.4s: in pass A that's 2.4s of an API worker per photo, and in pass B it's the bucket's problem while the API handles two small requests. The API's log shows only `POST /uploads` and `POST /uploads/{id}/complete` per photo. M8 turns `complete` into "enqueue a job", making both requests genuinely tiny.
+
 ## Known gaps
 
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
-- If the database commit fails after the objects are written, the objects are orphaned (the dual-write problem). A cleanup job addresses this.
-- Uploads pass through the API and are read fully into memory. Presigned URLs (M5 pass B) fix this.
+- Orphan cleanup (`python -m app.cleanup`) is run by hand. M8's worker will run it on a schedule.
+- `complete` downloads the whole original into API memory to process it. M8 moves this to the worker.
+- Anyone can request upload URLs: there are no accounts until M11. The 200 MB per-file cap limits the damage, not the count.
 - SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them. The app sets an explicit CORS rule for `APP_ORIGIN` on startup, so production behaves correctly, but locally the permissive default hides mistakes in that rule.
 - RAW files and video aren't decoded: they're stored, with no metadata or previews.
 - A wall-clock time in the repeated hour when clocks fall back is ambiguous. We take the first occurrence. Only a recorded offset or GPS time can disambiguate it.

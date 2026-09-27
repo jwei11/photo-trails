@@ -42,7 +42,10 @@ def recompute(conn: Connection) -> None:
 def all_photos() -> list[dict]:
     with engine.connect() as conn:
         rows = conn.execute(
-            text(f"SELECT {PHOTO_COLUMNS} FROM photos ORDER BY shot_at NULLS LAST, created_at")
+            text(
+                f"SELECT {PHOTO_COLUMNS} FROM photos WHERE status = 'ready' "
+                "ORDER BY shot_at NULLS LAST, created_at"
+            )
         )
         return [dict(row._mapping) for row in rows]
 
@@ -51,7 +54,8 @@ def get_photo(photo_id: str, include_exif: bool = False) -> dict | None:
     columns = PHOTO_COLUMNS + (", exif" if include_exif else "")
     with engine.connect() as conn:
         row = conn.execute(
-            text(f"SELECT {columns} FROM photos WHERE id = :id"), {"id": photo_id}
+            text(f"SELECT {columns} FROM photos WHERE id = :id AND status = 'ready'"),
+            {"id": photo_id},
         ).first()
         return dict(row._mapping) if row else None
 
@@ -61,45 +65,103 @@ def _safe_extension(filename: str | None) -> str:
     return ext if re.fullmatch(r"\.[a-z0-9]{1,10}", ext) else ""
 
 
+class UploadNotFound(Exception):
+    pass
+
+
+class UploadNotReceived(Exception):
+    pass
+
+
+def create_pending(original_filename: str | None, content_type: str, size_bytes: int) -> dict:
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                WITH new AS (SELECT gen_random_uuid() AS id)
+                INSERT INTO photos (id, original_filename, content_type, size_bytes, storage_key, status)
+                SELECT new.id, :filename, :content_type, :size, new.id::text || :ext, 'pending'
+                FROM new
+                RETURNING id, storage_key
+                """
+            ),
+            {
+                "filename": original_filename,
+                "content_type": content_type,
+                "size": size_bytes,
+                "ext": _safe_extension(original_filename),
+            },
+        ).one()
+    return {"id": str(row.id), "storage_key": row.storage_key}
+
+
 def add_photo(original_filename: str | None, content_type: str, contents: bytes) -> dict:
+    """Upload through the API (M5 pass A): the same steps a presigned upload goes through."""
+    pending = create_pending(original_filename, content_type, len(contents))
+    objects.put(pending["storage_key"], contents, content_type)
+    return complete_upload(pending["id"], contents)
+
+
+def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
+    """Process an uploaded original and mark it ready. Safe to call more than once."""
     started = time.perf_counter()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT storage_key, size_bytes, status FROM photos WHERE id = :id"),
+            {"id": photo_id},
+        ).first()
+    if row is None:
+        raise UploadNotFound
+    if row.status == "ready":
+        return get_photo(photo_id)
+    if contents is None:
+        if objects.size(row.storage_key) != row.size_bytes:
+            raise UploadNotReceived
+        contents = objects.get(row.storage_key)
+
+    # Slow CPU work happens before taking the write lock, so uploads still process in parallel.
     try:
         processed = images.process(contents)
         error = None
     except Exception as exc:  # any undecodable upload is stored, flagged, and skipped
         processed, error = None, f"{type(exc).__name__}: {exc}"
     process_ms = round((time.perf_counter() - started) * 1000)
-
     meta = processed.metadata if processed else None
+
     with engine.begin() as conn:
         lock_writes(conn)
-        row = conn.execute(
+        status = conn.execute(
+            text("SELECT status FROM photos WHERE id = :id"), {"id": photo_id}
+        ).scalar_one_or_none()
+        if status is None:
+            raise UploadNotFound  # swept as an orphan while we were processing
+        if status == "ready":
+            return get_photo(photo_id)  # a concurrent completion finished first
+
+        # Keys depend only on the id, so a retry overwrites rather than duplicates.
+        thumb_key = web_key = None
+        if processed:
+            thumb_key, web_key = f"{photo_id}_thumb.webp", f"{photo_id}_web.webp"
+            objects.put(thumb_key, processed.thumb, "image/webp")
+            objects.put(web_key, processed.web, "image/webp")
+
+        conn.execute(
             text(
                 """
-                WITH new AS (SELECT gen_random_uuid() AS id)
-                INSERT INTO photos (
-                    id, original_filename, content_type, size_bytes, storage_key,
-                    camera_make, camera_model, camera_serial, camera_time, exif_offset_min,
-                    gps_time, lat, lon, altitude_m, width, height, orientation, exif,
-                    thumb_key, web_key, processing_error, processing_ms
-                )
-                SELECT
-                    new.id, :filename, :content_type, :size, new.id::text || :ext,
-                    :camera_make, :camera_model, :camera_serial, :camera_time, :exif_offset_min,
-                    :gps_time, :lat, :lon, :altitude_m, :width, :height, :orientation,
-                    CAST(:exif AS jsonb),
-                    CASE WHEN :has_derivatives THEN new.id::text || '_thumb.webp' END,
-                    CASE WHEN :has_derivatives THEN new.id::text || '_web.webp' END,
-                    :error, :process_ms
-                FROM new
-                RETURNING id, storage_key, thumb_key, web_key
+                UPDATE photos SET
+                    status = 'ready',
+                    camera_make = :camera_make, camera_model = :camera_model,
+                    camera_serial = :camera_serial, camera_time = :camera_time,
+                    exif_offset_min = :exif_offset_min, gps_time = :gps_time,
+                    lat = :lat, lon = :lon, altitude_m = :altitude_m,
+                    width = :width, height = :height, orientation = :orientation,
+                    exif = CAST(:exif AS jsonb), thumb_key = :thumb_key, web_key = :web_key,
+                    processing_error = :error, processing_ms = :process_ms
+                WHERE id = :id
                 """
             ),
             {
-                "filename": original_filename,
-                "content_type": content_type,
-                "size": len(contents),
-                "ext": _safe_extension(original_filename),
+                "id": photo_id,
                 "camera_make": meta and meta.camera_make,
                 "camera_model": meta and meta.camera_model,
                 "camera_serial": meta and meta.camera_serial,
@@ -113,24 +175,20 @@ def add_photo(original_filename: str | None, content_type: str, contents: bytes)
                 "height": meta and meta.height,
                 "orientation": meta and meta.orientation,
                 "exif": json.dumps(meta.tags) if meta else None,
-                "has_derivatives": processed is not None,
+                "thumb_key": thumb_key,
+                "web_key": web_key,
                 "error": error,
                 "process_ms": process_ms,
             },
-        ).one()
-
-        objects.put(row.storage_key, contents, content_type)
-        if processed:
-            objects.put(row.thumb_key, processed.thumb, "image/webp")
-            objects.put(row.web_key, processed.web, "image/webp")
+        )
         recompute(conn)
 
     total_ms = round((time.perf_counter() - started) * 1000)
     log.info(
-        "photo stored id=%s bytes=%d process_ms=%d total_ms=%d error=%s",
-        row.id, len(contents), process_ms, total_ms, error,
+        "photo ready id=%s bytes=%d process_ms=%d total_ms=%d error=%s",
+        photo_id, len(contents), process_ms, total_ms, error,
     )
-    return get_photo(str(row.id))
+    return get_photo(photo_id)
 
 
 def resolve_times(conn: Connection) -> int:
