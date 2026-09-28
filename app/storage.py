@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import re
@@ -73,26 +74,62 @@ class UploadNotReceived(Exception):
     pass
 
 
-def create_pending(original_filename: str | None, content_type: str, size_bytes: int) -> dict:
-    with engine.begin() as conn:
-        row = conn.execute(
-            text(
-                """
-                WITH new AS (SELECT gen_random_uuid() AS id)
-                INSERT INTO photos (id, original_filename, content_type, size_bytes, storage_key, status)
-                SELECT new.id, :filename, :content_type, :size, new.id::text || :ext, 'pending'
-                FROM new
-                RETURNING id, storage_key
-                """
-            ),
-            {
-                "filename": original_filename,
-                "content_type": content_type,
-                "size": size_bytes,
-                "ext": _safe_extension(original_filename),
-            },
-        ).one()
+def create_pending(
+    original_filename: str | None, content_type: str, size_bytes: int, conn: Connection | None = None
+) -> dict:
+    if conn is None:
+        with engine.begin() as own:
+            return create_pending(original_filename, content_type, size_bytes, own)
+    row = conn.execute(
+        text(
+            """
+            WITH new AS (SELECT gen_random_uuid() AS id)
+            INSERT INTO photos (id, original_filename, content_type, size_bytes, storage_key, status)
+            SELECT new.id, :filename, :content_type, :size, new.id::text || :ext, 'pending'
+            FROM new
+            RETURNING id, storage_key
+            """
+        ),
+        {
+            "filename": original_filename,
+            "content_type": content_type,
+            "size": size_bytes,
+            "ext": _safe_extension(original_filename),
+        },
+    ).one()
     return {"id": str(row.id), "storage_key": row.storage_key}
+
+
+class DuplicatePhoto(Exception):
+    def __init__(self, original_id: str):
+        super().__init__(original_id)
+        self.original_id = original_id
+
+
+def find_by_hashes(hashes: list[str]) -> dict[str, str]:
+    """Map content hash -> id of the ready photo that already has it."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT content_sha256, id FROM photos WHERE content_sha256 = ANY(:hashes)"),
+            {"hashes": hashes},
+        )
+        return {r.content_sha256: str(r.id) for r in rows}
+
+
+def _duplicate_of(conn: Connection, sha256: str, photo_id: str) -> str | None:
+    found = conn.execute(
+        text("SELECT id FROM photos WHERE content_sha256 = :sha AND id != :id"),
+        {"sha": sha256, "id": photo_id},
+    ).scalar_one_or_none()
+    return str(found) if found else None
+
+
+def _discard_pending(photo_id: str, storage_key: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM photos WHERE id = :id AND status = 'pending'"), {"id": photo_id}
+        )
+    objects.delete(storage_key)
 
 
 def add_photo(original_filename: str | None, content_type: str, contents: bytes) -> dict:
@@ -103,7 +140,10 @@ def add_photo(original_filename: str | None, content_type: str, contents: bytes)
 
 
 def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
-    """Process an uploaded original and mark it ready. Safe to call more than once."""
+    """Process an uploaded original and mark it ready. Safe to call more than once.
+
+    Raises DuplicatePhoto (after discarding this upload) if identical bytes are already stored.
+    """
     started = time.perf_counter()
     with engine.connect() as conn:
         row = conn.execute(
@@ -119,6 +159,14 @@ def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
             raise UploadNotReceived
         contents = objects.get(row.storage_key)
 
+    # The hash of the bytes actually stored, not the one the client declared.
+    sha256 = hashlib.sha256(contents).hexdigest()
+    with engine.connect() as conn:
+        original = _duplicate_of(conn, sha256, photo_id)
+    if original:
+        _discard_pending(photo_id, row.storage_key)
+        raise DuplicatePhoto(original)
+
     # Slow CPU work happens before taking the write lock, so uploads still process in parallel.
     try:
         processed = images.process(contents)
@@ -126,7 +174,6 @@ def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
     except Exception as exc:  # any undecodable upload is stored, flagged, and skipped
         processed, error = None, f"{type(exc).__name__}: {exc}"
     process_ms = round((time.perf_counter() - started) * 1000)
-    meta = processed.metadata if processed else None
 
     with engine.begin() as conn:
         lock_writes(conn)
@@ -137,51 +184,13 @@ def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
             raise UploadNotFound  # swept as an orphan while we were processing
         if status == "ready":
             return get_photo(photo_id)  # a concurrent completion finished first
-
-        # Keys depend only on the id, so a retry overwrites rather than duplicates.
-        thumb_key = web_key = None
-        if processed:
-            thumb_key, web_key = f"{photo_id}_thumb.webp", f"{photo_id}_web.webp"
-            objects.put(thumb_key, processed.thumb, "image/webp")
-            objects.put(web_key, processed.web, "image/webp")
-
-        conn.execute(
-            text(
-                """
-                UPDATE photos SET
-                    status = 'ready',
-                    camera_make = :camera_make, camera_model = :camera_model,
-                    camera_serial = :camera_serial, camera_time = :camera_time,
-                    exif_offset_min = :exif_offset_min, gps_time = :gps_time,
-                    lat = :lat, lon = :lon, altitude_m = :altitude_m,
-                    width = :width, height = :height, orientation = :orientation,
-                    exif = CAST(:exif AS jsonb), thumb_key = :thumb_key, web_key = :web_key,
-                    processing_error = :error, processing_ms = :process_ms
-                WHERE id = :id
-                """
-            ),
-            {
-                "id": photo_id,
-                "camera_make": meta and meta.camera_make,
-                "camera_model": meta and meta.camera_model,
-                "camera_serial": meta and meta.camera_serial,
-                "camera_time": meta and meta.camera_time,
-                "exif_offset_min": meta and meta.exif_offset_min,
-                "gps_time": meta and meta.gps_time,
-                "lat": meta and meta.lat,
-                "lon": meta and meta.lon,
-                "altitude_m": meta and meta.altitude_m,
-                "width": meta and meta.width,
-                "height": meta and meta.height,
-                "orientation": meta and meta.orientation,
-                "exif": json.dumps(meta.tags) if meta else None,
-                "thumb_key": thumb_key,
-                "web_key": web_key,
-                "error": error,
-                "process_ms": process_ms,
-            },
-        )
-        recompute(conn)
+        # Re-check under the lock: an identical file may have completed while we processed.
+        original = _duplicate_of(conn, sha256, photo_id)
+        if original is None:
+            _store_processed(conn, photo_id, sha256, processed, error, process_ms)
+    if original:
+        _discard_pending(photo_id, row.storage_key)
+        raise DuplicatePhoto(original)
 
     total_ms = round((time.perf_counter() - started) * 1000)
     log.info(
@@ -189,6 +198,57 @@ def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
         photo_id, len(contents), process_ms, total_ms, error,
     )
     return get_photo(photo_id)
+
+
+def _store_processed(
+    conn: Connection, photo_id: str, sha256: str, processed, error: str | None, process_ms: int
+) -> None:
+    meta = processed.metadata if processed else None
+    # Keys depend only on the id, so a retry overwrites rather than duplicates.
+    thumb_key = web_key = None
+    if processed:
+        thumb_key, web_key = f"{photo_id}_thumb.webp", f"{photo_id}_web.webp"
+        objects.put(thumb_key, processed.thumb, "image/webp")
+        objects.put(web_key, processed.web, "image/webp")
+
+    conn.execute(
+        text(
+            """
+            UPDATE photos SET
+                status = 'ready', content_sha256 = :sha256,
+                camera_make = :camera_make, camera_model = :camera_model,
+                camera_serial = :camera_serial, camera_time = :camera_time,
+                exif_offset_min = :exif_offset_min, gps_time = :gps_time,
+                lat = :lat, lon = :lon, altitude_m = :altitude_m,
+                width = :width, height = :height, orientation = :orientation,
+                exif = CAST(:exif AS jsonb), thumb_key = :thumb_key, web_key = :web_key,
+                processing_error = :error, processing_ms = :process_ms
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": photo_id,
+            "sha256": sha256,
+            "camera_make": meta and meta.camera_make,
+            "camera_model": meta and meta.camera_model,
+            "camera_serial": meta and meta.camera_serial,
+            "camera_time": meta and meta.camera_time,
+            "exif_offset_min": meta and meta.exif_offset_min,
+            "gps_time": meta and meta.gps_time,
+            "lat": meta and meta.lat,
+            "lon": meta and meta.lon,
+            "altitude_m": meta and meta.altitude_m,
+            "width": meta and meta.width,
+            "height": meta and meta.height,
+            "orientation": meta and meta.orientation,
+            "exif": json.dumps(meta.tags) if meta else None,
+            "thumb_key": thumb_key,
+            "web_key": web_key,
+            "error": error,
+            "process_ms": process_ms,
+        },
+    )
+    recompute(conn)
 
 
 def resolve_times(conn: Connection) -> int:

@@ -33,7 +33,9 @@ def client(migrated_db):
     from app import objects
 
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE photos, camera_clock_offsets, trips, homes"))
+        conn.execute(
+            text("TRUNCATE photos, camera_clock_offsets, trips, homes, imports, import_items")
+        )
     with TestClient(app) as c:  # startup creates the test bucket if needed
         objects.delete(*(key for key, _ in objects.list_keys()))
         yield c

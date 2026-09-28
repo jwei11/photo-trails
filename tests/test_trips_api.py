@@ -5,8 +5,9 @@ from tests.test_api import jpeg, upload
 LISBON = (38.72, -9.14)
 
 
-def shoot(client, name, day, hour, where=LISBON):
-    return upload(client, name, jpeg(f"2025:07:{day:02d} {hour:02d}:00:00", "+01:00", *where))
+def shoot(client, name, day, hour, where=LISBON, minute=0):
+    when = f"2025:07:{day:02d} {hour:02d}:{minute:02d}:00"
+    return upload(client, name, jpeg(when, "+01:00", *where))
 
 
 def trips(client):
@@ -36,7 +37,7 @@ def test_rename_locks_the_trip_and_late_photos_inside_it_join(client, two_trips)
     res = client.patch(f"/trips/{first_id}", json={"name": "Lisbon weekend"})
     assert res.status_code == 200 and res.json()["is_locked"]
 
-    late = shoot(client, "friend.jpg", 1, 11)  # inside the renamed trip's time span
+    late = shoot(client, "friend.jpg", 1, 11, minute=30)  # inside the renamed trip's time span
     assert photo_trip(client, late["id"]) == first_id
     assert trips(client)[0]["name"] == "Lisbon weekend"
 

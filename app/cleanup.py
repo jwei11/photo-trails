@@ -10,8 +10,9 @@ from app.db import engine
 
 log = logging.getLogger(__name__)
 
-# Must comfortably exceed the upload URL lifetime, and the time a completion takes, so the
-# sweep never races an upload or completion that's still legitimately in progress.
+# Age is measured from the last upload URL issued for a pending photo (URLs expire after
+# 15 minutes, and a client that wants to upload gets a fresh one). One hour comfortably
+# exceeds a URL's lifetime plus a completion, so the sweep never races an active upload.
 DEFAULT_MAX_AGE = timedelta(hours=1)
 
 
@@ -24,18 +25,20 @@ def sweep(max_age: timedelta = DEFAULT_MAX_AGE, dry_run: bool = False) -> dict:
         stale = conn.execute(
             text(
                 "SELECT id, storage_key FROM photos WHERE status = 'pending' "
-                "AND created_at <= now() - make_interval(secs => :max_age)"
+                "AND coalesce(upload_url_issued_at, created_at) <= now() - make_interval(secs => :max_age)"
             ),
             {"max_age": max_age.total_seconds()},
         ).all()
         if stale and not dry_run:
-            # Re-check status in the DELETE: a completion may have finished since the SELECT.
+            # Re-check in the DELETE: since the SELECT, a completion may have finished or a
+            # fresh upload URL may have been issued.
             stale = conn.execute(
                 text(
                     "DELETE FROM photos WHERE id = ANY(:ids) AND status = 'pending' "
+                    "AND coalesce(upload_url_issued_at, created_at) <= now() - make_interval(secs => :max_age) "
                     "RETURNING id, storage_key"
                 ),
-                {"ids": [r.id for r in stale]},
+                {"ids": [r.id for r in stale], "max_age": max_age.total_seconds()},
             ).all()
         referenced = {
             key

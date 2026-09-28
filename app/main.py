@@ -11,7 +11,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app import objects, storage, trip_store
+from app import imports, objects, storage, trip_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -62,13 +62,20 @@ async def upload_photo(file: UploadFile):
     contents = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File is larger than 200 MB")
-    return await run_in_threadpool(storage.add_photo, file.filename, content_type, contents)
+    try:
+        return await run_in_threadpool(storage.add_photo, file.filename, content_type, contents)
+    except storage.DuplicatePhoto as dup:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "This photo is already imported", "photo_id": dup.original_id},
+        )
 
 
-class UploadRequest(BaseModel):
+class ImportFile(BaseModel):
     filename: str | None = Field(default=None, max_length=255)
     content_type: str
     size_bytes: int = Field(gt=0, le=MAX_UPLOAD_BYTES)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("content_type")
     @classmethod
@@ -76,28 +83,53 @@ class UploadRequest(BaseModel):
         return check_content_type(value)
 
 
-@app.post("/uploads", status_code=201)
-def request_upload(body: UploadRequest):
-    """Step 1 of 3: get a signed URL to PUT the file straight into storage."""
-    pending = storage.create_pending(body.filename, body.content_type, body.size_bytes)
-    return {
-        "photo_id": pending["id"],
-        "upload_url": objects.upload_url(pending["storage_key"], body.content_type, body.size_bytes),
-        "method": "PUT",
-        "headers": {"Content-Type": body.content_type},
-        "expires_in": objects.UPLOAD_URL_TTL,
-    }
+class ImportRequest(BaseModel):
+    files: list[ImportFile] = Field(min_length=1, max_length=2000)
 
 
-@app.post("/uploads/{photo_id}/complete")
-def complete_upload(photo_id: uuid.UUID):
-    """Step 3 of 3: after the PUT succeeds, process the photo. Safe to retry."""
+class UploadFailure(BaseModel):
+    error: str = Field(min_length=1, max_length=500)
+
+
+def _import_errors(fn, *args):
     try:
-        return storage.complete_upload(str(photo_id))
-    except storage.UploadNotFound:
-        raise HTTPException(status_code=404, detail="Upload not found or expired")
-    except storage.UploadNotReceived:
-        raise HTTPException(status_code=409, detail="The file hasn't been uploaded yet")
+        return fn(*args)
+    except imports.ImportNotFound:
+        raise HTTPException(status_code=404, detail="Import or item not found")
+    except imports.InvalidItemState as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/imports", status_code=201)
+def create_import(body: ImportRequest):
+    """Register a batch; returns a signed upload URL for each file not already stored."""
+    return imports.create_import([f.model_dump() for f in body.files])
+
+
+@app.get("/imports")
+def list_imports():
+    return imports.list_imports()
+
+
+@app.get("/imports/{import_id}")
+def get_import(import_id: uuid.UUID):
+    return _import_errors(imports.get_import, str(import_id))
+
+
+@app.post("/imports/{import_id}/items/{item_id}/upload-url")
+def renew_upload_url(import_id: uuid.UUID, item_id: uuid.UUID):
+    return _import_errors(imports.renew_upload_url, str(import_id), str(item_id))
+
+
+@app.post("/imports/{import_id}/items/{item_id}/complete")
+def complete_import_item(import_id: uuid.UUID, item_id: uuid.UUID):
+    """After the file's PUT succeeds: process it. Safe to retry."""
+    return _import_errors(imports.complete_item, str(import_id), str(item_id))
+
+
+@app.post("/imports/{import_id}/items/{item_id}/failed")
+def report_upload_failure(import_id: uuid.UUID, item_id: uuid.UUID, body: UploadFailure):
+    return _import_errors(imports.report_upload_failure, str(import_id), str(item_id), body.error)
 
 
 @app.get("/photos")

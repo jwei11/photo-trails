@@ -47,6 +47,14 @@
   .trip-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
   .actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
   button.small, select.small { font-size: 12px; padding: 2px 6px; }
+  #import-items { margin-top: 8px; max-height: 320px; overflow-y: auto; }
+  .import-row { display: grid; grid-template-columns: minmax(0, 1fr) 70px 120px 120px auto auto; gap: 8px; align-items: center; padding: 3px 0; font-size: 13px; }
+  .import-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .import-row progress { width: 100%; }
+  .import-row.failed .state { color: #a32d2d; }
+  .import-row .full { grid-column: 1 / -1; font-size: 12px; }
+  #past-imports { margin-top: 8px; }
+  @media (max-width: 600px) { .import-row { grid-template-columns: minmax(0, 1fr) 90px auto; } .import-row .muted, .import-row progress { display: none; } }
   input:not([type=number]):not([type=file]) { padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
 </style>
 </head>
@@ -57,10 +65,17 @@
 
   <section class="panel">
     <div class="row">
+      <strong>Import photos</strong>
       <input type="file" id="files" multiple accept="image/*,.heic,.heif">
-      <button class="primary" id="upload">Upload</button>
-      <span class="muted" id="upload-status"></span>
+      <button class="primary" id="upload">Import</button>
+      <span class="muted" id="import-summary"></span>
     </div>
+    <input type="file" id="resume-files" multiple hidden>
+    <div id="import-items"></div>
+    <details id="past-imports">
+      <summary class="muted">Recent imports</summary>
+      <div id="imports-list"></div>
+    </details>
   </section>
 
   <section class="panel">
@@ -343,29 +358,225 @@ async function refresh() {
   }
 }
 
-// Three requests: ask the API for a signed URL, PUT the file straight to storage
-// (the API never sees the bytes), then tell the API it's there.
-async function uploadDirect(file) {
-  const contentType = file.type || "application/octet-stream";
-  const ticket = await api("/uploads", json("POST", {
-    filename: file.name, content_type: contentType, size_bytes: file.size,
-  }));
-  const put = await fetch(ticket.upload_url, { method: "PUT", headers: ticket.headers, body: file });
-  if (!put.ok) throw new Error(`storage rejected the upload (${put.status})`);
-  return api(`/uploads/${ticket.photo_id}/complete`, { method: "POST" });
+// ---- Bulk import ----------------------------------------------------------------
+// The browser hashes each file, registers the whole batch in one request (files the
+// server already has come back as duplicates), then uploads the rest straight to
+// storage 4 at a time and asks the server to process each one.
+
+const PARALLEL_UPLOADS = 4;
+const UPLOADABLE = /^(image\/(?!svg)[\w.+-]+|application\/octet-stream)$/;
+const importState = { id: null, items: [], files: new Map(), progress: new Map() };
+
+async function sha256Hex(file) {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-document.getElementById("upload").addEventListener("click", async () => {
-  const files = [...document.getElementById("files").files];
-  const status = document.getElementById("upload-status");
-  let failed = 0;
-  for (const [i, file] of files.entries()) {
-    status.textContent = `Uploading ${i + 1} of ${files.length}…`;
-    try { await uploadDirect(file); } catch { failed++; }
+function formatSize(bytes) {
+  return bytes > 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} KB`;
+}
+
+async function pool(tasks, limit) {
+  let next = 0;
+  const worker = async () => { while (next < tasks.length) await tasks[next++](); };
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+}
+
+// fetch() can't report upload progress, so the PUT uses XMLHttpRequest.
+function putWithProgress(url, file, contentType, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("Content-Type", contentType);
+    xhr.upload.onprogress = e => e.lengthComputable && onProgress(e.loaded / e.total);
+    xhr.onload = () => xhr.status < 300 ? resolve() : reject(new Error(`storage rejected the upload (${xhr.status})`));
+    xhr.onerror = () => reject(new Error("network error during upload"));
+    xhr.send(file);
+  });
+}
+
+function setItem(item) {
+  const i = importState.items.findIndex(x => x.id === item.id);
+  importState.items[i] = { ...importState.items[i], ...item };
+  renderImport();
+}
+
+async function uploadItem(item) {
+  const file = importState.files.get(item.id);
+  const base = `/imports/${importState.id}/items/${item.id}`;
+  // A renewal can report the file already finished (e.g. a lost response); then we're done.
+  const renew = async () => {
+    const renewed = await api(`${base}/upload-url`, { method: "POST" });
+    if (!renewed.upload_url) setItem(renewed);
+    return renewed;
+  };
+  try {
+    if (!item.upload_url || item.status === "failed") {
+      item = await renew();
+      if (!item.upload_url) return;
+    }
+    setItem({ ...item, status: "uploading" });
+    const onProgress = p => { importState.progress.set(item.id, p); renderImport(); };
+    try {
+      await putWithProgress(item.upload_url, file, item.content_type, onProgress);
+    } catch {
+      // One automatic retry with a fresh URL: covers expired URLs in long imports and
+      // brief network blips. A second failure is reported and shown with a Retry button.
+      item = await renew();
+      if (!item.upload_url) return;
+      await putWithProgress(item.upload_url, file, item.content_type, onProgress);
+    }
+    importState.progress.set(item.id, 1);
+    setItem({ ...item, status: "processing" });
+    setItem(await api(`${base}/complete`, { method: "POST" }));
+  } catch (e) {
+    try {
+      setItem(await api(`${base}/failed`, json("POST", { error: e.message.slice(0, 500) })));
+    } catch {
+      setItem({ ...item, status: "failed", failed_stage: "upload", error: e.message });
+    }
   }
-  status.textContent = files.length ? `Done: ${files.length - failed} uploaded${failed ? `, ${failed} failed` : ""}.` : "";
+}
+
+async function retryItem(item) {
+  if (item.failed_stage === "processing") {
+    setItem({ ...item, status: "processing" });
+    setItem(await api(`/imports/${importState.id}/items/${item.id}/complete`, { method: "POST" }));
+  } else if (importState.files.has(item.id)) {
+    await uploadItem(item);
+  } else {
+    document.getElementById("resume-files").click();  // file isn't in memory: pick it again
+  }
   await refresh();
+}
+
+async function startImport(files) {
+  const summary = document.getElementById("import-summary");
+  const skipped = files.filter(f => !UPLOADABLE.test(f.type || "application/octet-stream"));
+  files = files.filter(f => !skipped.includes(f));
+  if (!files.length) {
+    summary.textContent = skipped.length ? "Only image files can be imported." : "";
+    return;
+  }
+  summary.textContent = `Checking ${plural(files.length, "file")} for duplicates…`;
+  // The same file picked twice (e.g. from two folders) is only sent once.
+  const described = [], unique = [], seen = new Set();
+  let repeats = 0;
+  for (const f of files) {
+    const sha256 = await sha256Hex(f);
+    if (seen.has(sha256)) { repeats++; continue; }
+    seen.add(sha256);
+    unique.push(f);
+    described.push({ filename: f.name, content_type: f.type || "application/octet-stream",
+                     size_bytes: f.size, sha256 });
+  }
+  const imp = await api("/imports", json("POST", { files: described }));
+  Object.assign(importState, { id: imp.id, items: imp.items, files: new Map(), progress: new Map() });
+  imp.items.forEach((item, i) => importState.files.set(item.id, unique[i]));
+  importState.skipped = skipped.map(f => f.name);
+  importState.repeats = repeats;
+  renderImport();
+
+  await pool(imp.items.filter(i => i.status === "uploading").map(i => () => uploadItem(i)), PARALLEL_UPLOADS);
+  await Promise.all([refresh(), renderPastImports()]);
+}
+
+async function resumeImport(files) {
+  // Match re-picked files to this import's unfinished items by content hash.
+  const byHash = new Map(importState.items
+    .filter(i => i.status === "uploading" || (i.status === "failed" && i.failed_stage === "upload"))
+    .map(i => [i.declared_sha256, i]));
+  const matched = [];
+  for (const f of files) {
+    const item = byHash.get(await sha256Hex(f));
+    if (item) { importState.files.set(item.id, f); matched.push(item); }
+  }
+  document.getElementById("import-summary").textContent =
+    `Resuming ${plural(matched.length, "file")}${files.length > matched.length ? ` (${files.length - matched.length} didn't match)` : ""}.`;
+  await pool(matched.map(i => () => uploadItem({ ...i, upload_url: null })), PARALLEL_UPLOADS);
+  await Promise.all([refresh(), renderPastImports()]);
+}
+
+async function openImport(id) {
+  const imp = await api(`/imports/${id}`);
+  Object.assign(importState, { id: imp.id, items: imp.items, files: new Map(), progress: new Map(), skipped: [], repeats: 0 });
+  renderImport();
+}
+
+const STATUS_TEXT = {
+  uploading: "waiting", processing: "processing", done: "imported",
+  duplicate: "already imported", failed: "failed",
+};
+
+function renderImport() {
+  const { items, progress } = importState;
+  const list = document.getElementById("import-items");
+  if (!items.length) { list.replaceChildren(); return; }
+  const count = s => items.filter(i => i.status === s).length;
+  const finished = count("done") + count("duplicate");
+  const parts = [`${finished} of ${items.length} done`];
+  if (count("duplicate")) parts.push(`${count("duplicate")} already imported`);
+  if (count("failed")) parts.push(`${count("failed")} failed`);
+  if (importState.skipped?.length) parts.push(`${importState.skipped.length} skipped (not images)`);
+  if (importState.repeats) parts.push(`${importState.repeats} selected twice, sent once`);
+  document.getElementById("import-summary").textContent = parts.join(" · ");
+
+  // Files that still need uploading but aren't in memory (the page was reloaded).
+  const needFiles = items.filter(i => !importState.files.has(i.id) &&
+    (i.status === "uploading" || (i.status === "failed" && i.failed_stage === "upload")));
+  const resume = needFiles.length
+    ? el("div", { class: "row" },
+        el("span", {}, `${plural(needFiles.length, "file")} still ${needFiles.length === 1 ? "needs" : "need"} uploading.`),
+        smallButton("Choose them again to resume", () => document.getElementById("resume-files").click()))
+    : null;
+
+  // Only list what needs attention or is in flight; finished files are just counted.
+  const shown = items.filter(i => !["done", "duplicate"].includes(i.status) || progress.has(i.id));
+  list.replaceChildren(...[resume].filter(Boolean), ...shown.slice(0, 200).map(item => {
+    const pct = Math.round((progress.get(item.id) || 0) * 100);
+    const active = item.status === "uploading" && progress.has(item.id) && pct < 100;
+    const label = active ? `uploading ${pct}%` : STATUS_TEXT[item.status];
+    const retry = item.status === "failed"
+      ? smallButton(item.failed_stage === "processing" ? "Retry processing" : "Retry upload",
+                    () => retryItem(item).catch(e => alert(e.message)))
+      : null;
+    const link = item.photo_id && ["done", "duplicate"].includes(item.status)
+      ? el("a", { href: `/photos/${item.photo_id}/web`, target: "_blank" }, "view") : null;
+    return el("div", { class: `import-row ${item.status}` },
+      el("span", { class: "name" }, item.filename || "(no name)"),
+      el("span", { class: "muted" }, formatSize(item.size_bytes)),
+      el("progress", { max: "100", value: String(item.status === "uploading" ? pct : 100) }),
+      el("span", { class: "state" }, label),
+      link, retry,
+      item.error ? el("div", { class: "error full" }, item.error) : null);
+  }));
+}
+
+async function renderPastImports() {
+  const list = document.getElementById("imports-list");
+  const past = await api("/imports");
+  list.replaceChildren(...past.map(p => {
+    const c = p.counts;
+    const bits = [`${c.done + c.duplicate} of ${c.total} done`];
+    if (c.failed) bits.push(`${c.failed} failed`);
+    if (c.uploading) bits.push(`${c.uploading} not uploaded`);
+    return el("div", { class: "row" },
+      el("span", {}, new Date(p.created_at).toLocaleString()),
+      el("span", { class: "muted" }, bits.join(" · ")),
+      c.failed || c.uploading ? smallButton("Open", () => openImport(p.id)) : null);
+  }));
+  if (!past.length) list.append(el("div", { class: "muted" }, "No imports yet."));
+}
+
+document.getElementById("upload").addEventListener("click", () => {
+  const input = document.getElementById("files");
+  startImport([...input.files]).catch(e => alert(e.message)).finally(() => { input.value = ""; });
 });
+document.getElementById("resume-files").addEventListener("change", e => {
+  resumeImport([...e.target.files]).catch(err => alert(err.message)).finally(() => { e.target.value = ""; });
+});
+
+renderPastImports();
 
 refresh();
 </script>
