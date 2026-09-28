@@ -2,6 +2,8 @@
 
 Drop in the photos from a trip. It reads the timestamps and GPS out of them, works out where you went and when, and puts it on a map.
 
+Built milestone by milestone following [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md).
+
 ## Setup
 
 ```bash
