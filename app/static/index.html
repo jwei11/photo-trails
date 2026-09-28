@@ -213,7 +213,7 @@ function tripSection(trip, next, allTrips) {
 
   const firstId = trip.days[0]?.photos[0]?.id;
   const cardFor = p => photoCard(p, [
-    p.id !== firstId ? smallButton("Split here", () => act(() =>
+    p.shot_at && p.id !== firstId ? smallButton("Split here", () => act(() =>
       api(`/trips/${trip.id}/split`, json("POST", { at: p.shot_at }))),
       "Start a new trip from this photo") : null,
     smallButton("Remove", () => act(() => api(`/photos/${p.id}/trip`, json("PUT", { trip_id: null }))),

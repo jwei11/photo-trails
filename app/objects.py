@@ -68,11 +68,15 @@ def size(key: str) -> int | None:
         raise
 
 
+MAX_KEYS_PER_DELETE = 1000  # S3's limit for one DeleteObjects request
+
+
 def delete(*keys: str) -> None:
     keys = [k for k in keys if k]
-    if keys:
+    for i in range(0, len(keys), MAX_KEYS_PER_DELETE):
+        batch = keys[i : i + MAX_KEYS_PER_DELETE]
         _internal().delete_objects(
-            Bucket=config.S3_BUCKET, Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True}
+            Bucket=config.S3_BUCKET, Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True}
         )
 
 

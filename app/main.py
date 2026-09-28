@@ -1,4 +1,5 @@
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, RedirectResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app import objects, storage, trip_store
 
@@ -36,22 +37,43 @@ def timeline_page():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+# The stored type is served back to browsers, so only allow types a browser won't run as a
+# page. SVG is an image type that can contain script, so it's excluded.
+UPLOAD_TYPE = re.compile(r"^(image/(?!svg)[\w.+-]+|application/octet-stream)$")
+
+
+def check_content_type(content_type: str) -> str:
+    if len(content_type) > 100 or not UPLOAD_TYPE.fullmatch(content_type):
+        raise ValueError("Only image files (or application/octet-stream) can be uploaded")
+    return content_type
+
+
 @app.post("/photos", status_code=201)
 async def upload_photo(file: UploadFile):
-    contents = await file.read()
-    return await run_in_threadpool(
-        storage.add_photo,
-        file.filename, file.content_type or "application/octet-stream", contents
-    )
-
-
-MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is larger than 200 MB")
+    content_type = file.content_type or "application/octet-stream"
+    try:
+        check_content_type(content_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc))
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is larger than 200 MB")
+    return await run_in_threadpool(storage.add_photo, file.filename, content_type, contents)
 
 
 class UploadRequest(BaseModel):
     filename: str | None = Field(default=None, max_length=255)
-    content_type: str = Field(pattern=r"^[\w.+-]+/[\w.+-]+$", max_length=100)
+    content_type: str
     size_bytes: int = Field(gt=0, le=MAX_UPLOAD_BYTES)
+
+    @field_validator("content_type")
+    @classmethod
+    def _allowed_type(cls, value: str) -> str:
+        return check_content_type(value)
 
 
 @app.post("/uploads", status_code=201)

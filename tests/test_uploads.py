@@ -72,6 +72,19 @@ def test_upload_request_validation(client):
     assert client.post("/uploads", json=bad_type).status_code == 422
 
 
+def test_only_image_types_can_be_uploaded(client):
+    def ask(content_type):
+        return client.post(
+            "/uploads", json={"filename": "a", "content_type": content_type, "size_bytes": 10}
+        ).status_code
+
+    for allowed in ("image/jpeg", "image/heic", "image/x-canon-cr3", "application/octet-stream"):
+        assert ask(allowed) == 201, allowed
+    # Types a browser would run as a page, served back from our bucket by /photos/{id}.
+    for blocked in ("text/html", "image/svg+xml", "application/xhtml+xml", "application/javascript"):
+        assert ask(blocked) == 422, blocked
+
+
 def test_unknown_upload_is_404(client):
     missing = "00000000-0000-0000-0000-000000000000"
     assert client.post(f"/uploads/{missing}/complete").status_code == 404

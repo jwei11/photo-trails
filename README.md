@@ -157,6 +157,8 @@ On one machine, pass B isn't faster one at a time: moving 3MB over loopback take
 - Orphan cleanup (`python -m app.cleanup`) is run by hand. M8's worker will run it on a schedule.
 - `complete` downloads the whole original into API memory to process it. M8 moves this to the worker.
 - Anyone can request upload URLs: there are no accounts until M11. The 200 MB per-file cap limits the damage, not the count.
+- `POST /photos` rejects files over 200 MB before reading them into memory, but the web framework has already saved the whole request to a temporary file on disk by then, so a huge upload still costs disk space. Presigned uploads don't have this problem, since the file never reaches the API.
+- Uploads are limited to `image/*` (except SVG, which can contain script) and `application/octet-stream`, because the stored type is served back to browsers. Photos uploaded before this rule keep whatever type they were given.
 - SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them. The app sets an explicit CORS rule for `APP_ORIGIN` on startup, so production behaves correctly, but locally the permissive default hides mistakes in that rule.
 - RAW files and video aren't decoded: they're stored, with no metadata or previews.
 - A wall-clock time in the repeated hour when clocks fall back is ambiguous. We take the first occurrence. Only a recorded offset or GPS time can disambiguate it.

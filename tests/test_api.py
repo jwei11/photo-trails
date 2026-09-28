@@ -53,6 +53,21 @@ def test_files_are_served_by_redirect_to_signed_bucket_urls(client):
     assert httpx.get(client.get(f"/photos/{photo['id']}", follow_redirects=False).headers["location"]).content == data
 
 
+def test_direct_upload_rejects_non_image_types(client):
+    res = client.post("/photos", files={"file": ("page.html", b"<script>alert(1)</script>", "text/html")})
+    assert res.status_code == 415
+    assert client.get("/photos").json() == []
+
+
+def test_direct_upload_rejects_files_over_the_size_limit(client, monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 100)
+    res = client.post("/photos", files={"file": ("big.jpg", b"x" * 101, "image/jpeg")})
+    assert res.status_code == 413
+    assert client.get("/photos").json() == []
+
+
 def test_timeline_days_are_in_date_order_across_the_date_line(client):
     # Tokyo morning of Jul 2 (00:00Z) happens *before* Honolulu afternoon of Jul 1 (02:00Z Jul 2).
     upload(client, "tokyo.jpg", jpeg("2025:07:02 09:00:00", "+09:00", 35.68, 139.69))
