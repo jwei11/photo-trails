@@ -6,7 +6,7 @@ from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Response, UploadFile
+from fastapi import APIRouter, FastAPI, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -23,6 +23,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Everything the frontend fetches lives under /api, so page URLs (/trips/abc) never
+# collide with API routes. /healthz stays at the root: it's for infrastructure.
+api = APIRouter(prefix="/api")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -50,7 +54,7 @@ def check_content_type(content_type: str) -> str:
     return content_type
 
 
-@app.post("/photos", status_code=201)
+@api.post("/photos", status_code=201)
 async def upload_photo(file: UploadFile):
     if file.size is not None and file.size > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File is larger than 200 MB")
@@ -100,39 +104,39 @@ def _import_errors(fn, *args):
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@app.post("/imports", status_code=201)
+@api.post("/imports", status_code=201)
 def create_import(body: ImportRequest):
     """Register a batch; returns a signed upload URL for each file not already stored."""
     return imports.create_import([f.model_dump() for f in body.files])
 
 
-@app.get("/imports")
+@api.get("/imports")
 def list_imports():
     return imports.list_imports()
 
 
-@app.get("/imports/{import_id}")
+@api.get("/imports/{import_id}")
 def get_import(import_id: uuid.UUID):
     return _import_errors(imports.get_import, str(import_id))
 
 
-@app.post("/imports/{import_id}/items/{item_id}/upload-url")
+@api.post("/imports/{import_id}/items/{item_id}/upload-url")
 def renew_upload_url(import_id: uuid.UUID, item_id: uuid.UUID):
     return _import_errors(imports.renew_upload_url, str(import_id), str(item_id))
 
 
-@app.post("/imports/{import_id}/items/{item_id}/complete")
+@api.post("/imports/{import_id}/items/{item_id}/complete")
 def complete_import_item(import_id: uuid.UUID, item_id: uuid.UUID):
     """After the file's PUT succeeds: process it. Safe to retry."""
     return _import_errors(imports.complete_item, str(import_id), str(item_id))
 
 
-@app.post("/imports/{import_id}/items/{item_id}/failed")
+@api.post("/imports/{import_id}/items/{item_id}/failed")
 def report_upload_failure(import_id: uuid.UUID, item_id: uuid.UUID, body: UploadFailure):
     return _import_errors(imports.report_upload_failure, str(import_id), str(item_id), body.error)
 
 
-@app.get("/photos")
+@api.get("/photos")
 def list_photos():
     return storage.all_photos()
 
@@ -155,22 +159,22 @@ def _redirect_to_object(key: str) -> RedirectResponse:
     )
 
 
-@app.get("/photos/{photo_id}")
+@api.get("/photos/{photo_id}")
 def get_photo_file(photo_id: uuid.UUID):
     return _redirect_to_object(_photo_or_404(photo_id)["storage_key"])
 
 
-@app.get("/photos/{photo_id}/metadata")
+@api.get("/photos/{photo_id}/metadata")
 def get_photo_metadata(photo_id: uuid.UUID):
     return _photo_or_404(photo_id, include_exif=True)
 
 
-@app.get("/photos/{photo_id}/thumb")
+@api.get("/photos/{photo_id}/thumb")
 def get_thumb(photo_id: uuid.UUID):
     return _derivative(photo_id, "thumb_key")
 
 
-@app.get("/photos/{photo_id}/web")
+@api.get("/photos/{photo_id}/web")
 def get_web(photo_id: uuid.UUID):
     return _derivative(photo_id, "web_key")
 
@@ -191,7 +195,7 @@ def _by_local_day(photos: list[dict]) -> list[dict]:
     return [{"date": d, "photos": ps} for d, ps in sorted(days.items())]
 
 
-@app.get("/timeline")
+@api.get("/timeline")
 def timeline():
     trips = trip_store.list_trips()
     photos_by_trip: dict[str | None, list] = {}
@@ -255,61 +259,61 @@ def _trip_errors(fn, *args):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/trips")
+@api.get("/trips")
 def list_trips():
     return trip_store.list_trips()
 
 
-@app.get("/trips/{trip_id}")
+@api.get("/trips/{trip_id}")
 def get_trip(trip_id: uuid.UUID):
     return _trip_errors(trip_store.get_trip, str(trip_id))
 
 
-@app.patch("/trips/{trip_id}")
+@api.patch("/trips/{trip_id}")
 def rename_trip(trip_id: uuid.UUID, body: TripRename):
     return _trip_errors(trip_store.rename_trip, str(trip_id), body.name)
 
 
-@app.post("/trips/{trip_id}/merge")
+@api.post("/trips/{trip_id}/merge")
 def merge_trips(trip_id: uuid.UUID, body: TripMerge):
     return _trip_errors(trip_store.merge_trips, str(trip_id), [str(t) for t in body.trip_ids])
 
 
-@app.post("/trips/{trip_id}/split")
+@api.post("/trips/{trip_id}/split")
 def split_trip(trip_id: uuid.UUID, body: TripSplit):
     first, second = _trip_errors(trip_store.split_trip, str(trip_id), body.at)
     return {"trips": [first, second]}
 
 
-@app.delete("/trips/{trip_id}", status_code=204)
+@api.delete("/trips/{trip_id}", status_code=204)
 def dissolve_trip(trip_id: uuid.UUID):
     _trip_errors(trip_store.dissolve_trip, str(trip_id))
     return Response(status_code=204)
 
 
-@app.put("/photos/{photo_id}/trip", status_code=204)
+@api.put("/photos/{photo_id}/trip", status_code=204)
 def move_photo(photo_id: uuid.UUID, body: PhotoTrip):
     _trip_errors(trip_store.move_photo, str(photo_id), str(body.trip_id) if body.trip_id else None)
     return Response(status_code=204)
 
 
-@app.get("/homes")
+@api.get("/homes")
 def list_homes():
     return trip_store.list_homes()
 
 
-@app.post("/homes", status_code=201)
+@api.post("/homes", status_code=201)
 def add_home(body: HomeIn):
     return trip_store.add_home(body.model_dump())
 
 
-@app.delete("/homes/{home_id}", status_code=204)
+@api.delete("/homes/{home_id}", status_code=204)
 def delete_home(home_id: uuid.UUID):
     _trip_errors(trip_store.delete_home, str(home_id))
     return Response(status_code=204)
 
 
-@app.get("/cameras")
+@api.get("/cameras")
 def list_cameras():
     return storage.list_cameras()
 
@@ -333,12 +337,12 @@ class ClockOffsetIn(BaseModel):
         return self
 
 
-@app.get("/camera-offsets")
+@api.get("/camera-offsets")
 def list_offsets():
     return storage.list_offsets()
 
 
-@app.post("/camera-offsets", status_code=201)
+@api.post("/camera-offsets", status_code=201)
 def add_offset(body: ClockOffsetIn):
     try:
         return storage.add_offset(body.model_dump())
@@ -349,8 +353,12 @@ def add_offset(body: ClockOffsetIn):
         )
 
 
-@app.delete("/camera-offsets/{offset_id}", status_code=204)
+@api.delete("/camera-offsets/{offset_id}", status_code=204)
 def delete_offset(offset_id: uuid.UUID):
     if storage.delete_offset(str(offset_id)) is None:
         raise HTTPException(status_code=404, detail="Offset not found")
     return Response(status_code=204)
+
+
+# Registered last: include_router copies the routes defined on `api` at the moment it runs.
+app.include_router(api)

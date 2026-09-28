@@ -29,13 +29,19 @@ def jpeg(when: str, offset: str, lat: float, lon: float) -> bytes:
 
 
 def upload(client, name: str, data: bytes):
-    res = client.post("/photos", files={"file": (name, data, "image/jpeg")})
+    res = client.post("/api/photos", files={"file": (name, data, "image/jpeg")})
     assert res.status_code == 201, res.text
     return res.json()
 
 
 def add_offset(client, **overrides):
-    return client.post("/camera-offsets", json={**FUJI, "offset_seconds": 3600, **overrides})
+    return client.post("/api/camera-offsets", json={**FUJI, "offset_seconds": 3600, **overrides})
+
+
+def test_api_is_under_prefix_and_healthz_is_not(client):
+    assert client.get("/api/photos").status_code == 200
+    assert client.get("/photos").status_code == 404
+    assert client.get("/healthz").json() == {"status": "ok"}
 
 
 def test_files_are_served_by_redirect_to_signed_bucket_urls(client):
@@ -43,29 +49,29 @@ def test_files_are_served_by_redirect_to_signed_bucket_urls(client):
     photo = upload(client, "a.jpg", data)
 
     for path, expected_type in [("", "image/jpeg"), ("/thumb", "image/webp"), ("/web", "image/webp")]:
-        res = client.get(f"/photos/{photo['id']}{path}", follow_redirects=False)
+        res = client.get(f"/api/photos/{photo['id']}{path}", follow_redirects=False)
         assert res.status_code == 302
         assert "X-Amz-Signature=" in res.headers["location"]
         assert res.headers["cache-control"].startswith("private")
         fetched = httpx.get(res.headers["location"])
         assert fetched.status_code == 200
         assert fetched.headers["content-type"] == expected_type
-    assert httpx.get(client.get(f"/photos/{photo['id']}", follow_redirects=False).headers["location"]).content == data
+    assert httpx.get(client.get(f"/api/photos/{photo['id']}", follow_redirects=False).headers["location"]).content == data
 
 
 def test_direct_upload_rejects_non_image_types(client):
-    res = client.post("/photos", files={"file": ("page.html", b"<script>alert(1)</script>", "text/html")})
+    res = client.post("/api/photos", files={"file": ("page.html", b"<script>alert(1)</script>", "text/html")})
     assert res.status_code == 415
-    assert client.get("/photos").json() == []
+    assert client.get("/api/photos").json() == []
 
 
 def test_direct_upload_rejects_files_over_the_size_limit(client, monkeypatch):
     from app import main
 
     monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 100)
-    res = client.post("/photos", files={"file": ("big.jpg", b"x" * 101, "image/jpeg")})
+    res = client.post("/api/photos", files={"file": ("big.jpg", b"x" * 101, "image/jpeg")})
     assert res.status_code == 413
-    assert client.get("/photos").json() == []
+    assert client.get("/api/photos").json() == []
 
 
 def test_timeline_days_are_in_date_order_across_the_date_line(client):
@@ -73,7 +79,7 @@ def test_timeline_days_are_in_date_order_across_the_date_line(client):
     upload(client, "tokyo.jpg", jpeg("2025:07:02 09:00:00", "+09:00", 35.68, 139.69))
     upload(client, "honolulu.jpg", jpeg("2025:07:01 16:00:00", "-10:00", 21.31, -157.86))
 
-    days = client.get("/timeline").json()["not_in_trip"]  # 2 photos: too few for a trip
+    days = client.get("/api/timeline").json()["not_in_trip"]  # 2 photos: too few for a trip
 
     assert [d["date"] for d in days] == ["2025-07-01", "2025-07-02"]
     assert [p["original_filename"] for d in days for p in d["photos"]] == ["honolulu.jpg", "tokyo.jpg"]
@@ -85,7 +91,7 @@ def test_overlapping_clock_offsets_are_rejected(client):
     res = add_offset(client)  # unbounded range overlaps the first
     assert res.status_code == 409
     assert "already has an offset" in res.json()["detail"]
-    assert len(client.get("/camera-offsets").json()) == 1
+    assert len(client.get("/api/camera-offsets").json()) == 1
 
 
 def test_adjacent_offset_ranges_and_other_cameras_are_allowed(client):

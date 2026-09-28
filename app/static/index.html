@@ -124,7 +124,7 @@ function el(tag, props = {}, ...children) {
 }
 
 async function api(path, options) {
-  const res = await fetch(path, options);
+  const res = await fetch(`/api${path}`, options);
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.status === 204 ? null : res.json();
 }
@@ -163,9 +163,9 @@ function formatRange(startIso, endIso) {
 
 function photoCard(p, actions = []) {
   const media = p.thumb_key
-    ? el("img", { src: `/photos/${p.id}/thumb`, loading: "lazy", alt: p.original_filename || "" })
+    ? el("img", { src: `/api/photos/${p.id}/thumb`, loading: "lazy", alt: p.original_filename || "" })
     : el("div", { class: "noimg" }, p.processing_error ? "Can't preview this file" : "No preview");
-  const link = el("a", { href: p.web_key ? `/photos/${p.id}/web` : `/photos/${p.id}`, target: "_blank" }, media);
+  const link = el("a", { href: p.web_key ? `/api/photos/${p.id}/web` : `/api/photos/${p.id}`, target: "_blank" }, media);
 
   const caption = el("figcaption");
   if (p.local_time) {
@@ -541,7 +541,7 @@ function renderImport() {
                     () => retryItem(item).catch(e => alert(e.message)))
       : null;
     const link = item.photo_id && ["done", "duplicate"].includes(item.status)
-      ? el("a", { href: `/photos/${item.photo_id}/web`, target: "_blank" }, "view") : null;
+      ? el("a", { href: `/api/photos/${item.photo_id}/web`, target: "_blank" }, "view") : null;
     return el("div", { class: `import-row ${item.status}` },
       el("span", { class: "name" }, item.filename || "(no name)"),
       el("span", { class: "muted" }, formatSize(item.size_bytes)),
