@@ -24,6 +24,8 @@ To serve it from the API instead, as in production, build it once with `npm run 
 
 Run the tests: `.venv/bin/python -m pytest`. The API tests need their own database, because they wipe it. Create it once with `docker compose exec db sh -c 'createdb -U $POSTGRES_USER trips_test'` and set `TEST_DATABASE_URL` in `.env`. Without it, those tests are skipped.
 
+Frontend tests: `cd frontend && npm test`. They render components in a simulated browser with a fake API, so they need neither the server nor the database.
+
 Reset all data from scratch (database and stored photos): `docker compose down -v && docker compose up -d --wait db objects && .venv/bin/alembic upgrade head`
 
 ## How a photo gets its time
@@ -132,6 +134,10 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **FastAPI sends `index.html` for any URL that isn't the API or a built file.** React Router picks the page from the URL in the browser, but a reload or a pasted link to `/trips/abc` asks the server for that path first. So when routing finds nothing for a GET or HEAD, FastAPI's 404 handler serves the real file from `frontend/dist` if there is one, and `index.html` otherwise. It hooks in after routing rather than being a catch-all route, which a first version did, and review caught two bugs in it. A catch-all matches every path, so FastAPI's own routing answers never happened (`/api/photos/` stopped redirecting to `/api/photos`, and a POST there got 405 instead). It also crashed with a 500 on a URL containing a null byte (`/%00`), which the handler treats as just another page URL. Unknown `/api/...` paths still get a JSON 404, because answering a bad API call with a web page would hide the bug. Paths are resolved and checked to stay inside the build folder (`/%2e%2e/` arrives decoded as `../`; tested). Vite puts a content hash in asset filenames (`index-CiJeS6AA.js`), so assets are cached for a year, while `index.html`, which names the current hashes, is re-checked on every load. A deploy is then picked up on the next page load without anyone clearing their cache.
 
+**Frontend tests use Vitest and React Testing Library.** Vitest is Vite's own test runner, so tests compile TypeScript and CSS Modules exactly as the app does, with no separate configuration. Testing Library renders a component and drives it the way a user would: find the button by its label, click it, check which API request went out and what the page shows afterwards. Tests don't depend on internal state or markup structure, so refactoring a component doesn't break them. Rejected: no frontend tests until CI in M12 (the backend's tests can't see a button that sends the wrong request) and Jest (the long-time default, but it needs its own TypeScript and CSS setup alongside Vite's).
+
+**Phase 2 order: React, then S3, then M7–M9.** The guide places the frontend switch at M9's map. Moving it to the start means M7's place names and M8's import progress are built once, in React, instead of in the old page first. S3 comes next because it's mostly configuration, and M8 may use SQS, which needs the same AWS account set up with a billing alarm.
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -188,7 +194,7 @@ The one duplicate in the first run was real: two generated screenshots were byte
 
 ## Known gaps
 
-- The React app so far only shows the timeline. Trip edits, imports, cameras, and homes are still on the Phase 1 page at `/old`.
+- The React app has the timeline and trip edits so far. Imports, cameras and clock offsets, and homes are still on the Phase 1 page at `/old`.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
 - Orphan cleanup (`python -m app.cleanup`) is run by hand. M8's worker will run it on a schedule.
 - `complete` downloads the whole original into API memory to process it. M8 moves this to the worker.

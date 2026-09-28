@@ -1,0 +1,87 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { render } from '@testing-library/react'
+import type { ReactNode } from 'react'
+import { MemoryRouter } from 'react-router'
+import { vi } from 'vitest'
+import type { Photo, Timeline, TimelineTrip } from '../api.ts'
+
+export type Call = { method: string; path: string; body: unknown }
+type Reply = { status: number; body?: unknown }
+
+/**
+ * Replaces fetch with a fake server. `timeline` answers GET /api/timeline; any other
+ * request is recorded in `calls` and answered by `reply` (204 No Content by default).
+ */
+export function fakeApi(timeline: Timeline, reply: (call: Call) => Reply = () => ({ status: 204 })) {
+  const calls: Call[] = []
+  vi.stubGlobal('fetch', vi.fn(async (url: string, options: RequestInit = {}) => {
+    const call = {
+      method: options.method ?? 'GET',
+      path: url,
+      body: options.body ? JSON.parse(options.body as string) : undefined,
+    }
+    calls.push(call)
+    const { status, body } = call.method === 'GET' && url === '/api/timeline' ? { status: 200, body: timeline } : reply(call)
+    return new Response(status === 204 ? null : JSON.stringify(body), { status })
+  }))
+  return {
+    calls,
+    edits: () => calls.filter((c) => c.method !== 'GET'),
+    timelineLoads: () => calls.filter((c) => c.path === '/api/timeline').length,
+  }
+}
+
+/** Renders a component with its own fresh cache, as the app would. */
+export function renderWithApp(ui: ReactNode) {
+  // No retries: a failed request should fail the test at once, not after back-offs.
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>{ui}</MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+export function photo(id: string, overrides: Partial<Photo> = {}): Photo {
+  return {
+    id,
+    original_filename: `${id}.jpg`,
+    content_type: 'image/jpeg',
+    camera_make: 'Apple',
+    camera_model: 'iPhone 15',
+    lat: 38.72,
+    lon: -9.14,
+    shot_at: '2025-07-01T08:30:00+00:00',
+    local_time: '2025-07-01T09:30:00',
+    tz_name: 'Europe/Lisbon',
+    local_offset_min: 60,
+    time_source: 'exif_offset',
+    thumb_key: `${id}_thumb.webp`,
+    web_key: `${id}_web.webp`,
+    processing_error: null,
+    trip_id: null,
+    ...overrides,
+  }
+}
+
+export function trip(id: string, photos: Photo[], overrides: Partial<TimelineTrip> = {}): TimelineTrip {
+  const days = new Map<string, Photo[]>()
+  for (const p of photos) {
+    const date = p.local_time!.slice(0, 10)
+    days.set(date, [...(days.get(date) ?? []), { ...p, trip_id: id }])
+  }
+  return {
+    id,
+    name: null,
+    is_locked: false,
+    start: photos[0].shot_at,
+    end: photos.at(-1)!.shot_at,
+    day_count: days.size,
+    photo_count: photos.length,
+    distance_km: 12.3,
+    bbox: null,
+    days: [...days].map(([date, ps]) => ({ date, photos: ps })),
+    undated: [],
+    ...overrides,
+  }
+}

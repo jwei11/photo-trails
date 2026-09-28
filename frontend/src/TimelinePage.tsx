@@ -1,92 +1,77 @@
 import { useQuery } from '@tanstack/react-query'
-import { api, photoUrl, type Day, type Photo, type Timeline } from './api.ts'
+import { api, tripEdits, type Photo, type Timeline, type TimelineTrip } from './api.ts'
+import DayList from './DayList.tsx'
+import { plural, tripTitle } from './format.ts'
+import PhotoGrid from './PhotoGrid.tsx'
 import styles from './TimelinePage.module.css'
+import TripSection from './TripSection.tsx'
+import { useEdit } from './useEdit.ts'
 
 export default function TimelinePage() {
-  // The key names this data in the shared cache; after an edit, invalidating
-  // ['timeline'] makes every component showing it refetch.
+  // The key names this data in the shared cache; useEdit invalidates ['timeline'] after
+  // every edit, which refetches it here.
   const { data, isPending, error } = useQuery({
     queryKey: ['timeline'],
     queryFn: () => api<Timeline>('/timeline'),
   })
+  // Edits on photos outside any trip ("Add to trip…").
+  const edit = useEdit()
 
   if (isPending) return <p className={styles.muted}>Loading…</p>
   if (error) return <p className={styles.error}>Couldn't load photos: {error.message}</p>
 
+  const { trips } = data
+  const loose = data.not_in_trip.reduce((n, day) => n + day.photos.length, 0)
+  const inTrips = trips.reduce((n, trip) => n + trip.photo_count, 0)
+  const total = inTrips + loose + data.undated.length
+  const addToTrip = (p: Photo) => (
+    <AddToTrip trips={trips} disabled={edit.isPending}
+      onPick={(tripId) => edit.mutate(() => tripEdits.movePhoto(p.id, tripId))} />
+  )
+
   return (
     <>
-      {data.trips.map((trip) => {
-        const first = trip.days[0]?.date
-        const last = trip.days.at(-1)?.date
-        return (
-          <section key={trip.id} className={styles.section}>
-            <h2>{trip.name ?? (first ? dateRange(first, last!) : 'Trip')}</h2>
-            <p className={styles.muted}>
-              {trip.photo_count} photos · {trip.day_count} days · {Math.round(trip.distance_km)} km
-            </p>
-            <DayList days={trip.days} />
-            {trip.undated.length > 0 && <PhotoGrid title="No date" photos={trip.undated} />}
-          </section>
-        )
-      })}
-      {data.not_in_trip.length > 0 && (
-        <section className={styles.section}>
-          <h2>Not in a trip</h2>
-          <DayList days={data.not_in_trip} />
+      <p className={styles.muted}>
+        {total ? `${plural(total, 'photo')} · ${plural(trips.length, 'trip')}` : 'No photos yet.'}
+      </p>
+      {edit.error && <p role="alert" className={styles.error}>{edit.error.message}</p>}
+      {trips.map((trip, i) => (
+        <TripSection key={trip.id} trip={trip} next={trips[i + 1]} />
+      ))}
+      {loose > 0 && (
+        <section className={styles.loose}>
+          <h2>
+            Not in a trip{' '}
+            <span className={styles.muted}>· {plural(loose, 'photo')} at home, in small groups, or removed</span>
+          </h2>
+          <DayList days={data.not_in_trip} actions={addToTrip} />
         </section>
       )}
       {data.undated.length > 0 && (
-        <section className={styles.section}>
-          <h2>Undated</h2>
-          <PhotoGrid photos={data.undated} />
+        <section className={styles.loose}>
+          <h2>
+            Undated <span className={styles.muted}>· {plural(data.undated.length, 'photo')} with no time information</span>
+          </h2>
+          <PhotoGrid photos={data.undated} actions={addToTrip} />
         </section>
       )}
     </>
   )
 }
 
-function DayList({ days }: { days: Day[] }) {
-  return days.map((day) => <PhotoGrid key={day.date} title={formatDay(day.date)} photos={day.photos} />)
-}
+type AddToTripProps = { trips: TimelineTrip[]; disabled: boolean; onPick: (tripId: string) => void }
 
-function PhotoGrid({ title, photos }: { title?: string; photos: Photo[] }) {
+function AddToTrip({ trips, disabled, onPick }: AddToTripProps) {
+  if (!trips.length) return null
+  // value="" keeps the select showing its prompt; picking a trip fires the edit, and the
+  // photo then disappears from this section when the timeline refetches.
   return (
-    <div>
-      {title && <h3 className={styles.day}>{title}</h3>}
-      <div className={styles.grid}>
-        {photos.map((p) => (
-          <PhotoCard key={p.id} photo={p} />
-        ))}
-      </div>
-    </div>
+    <select className="small" aria-label="Add to trip" value="" disabled={disabled}
+      onChange={(e) => onPick(e.target.value)}>
+      <option value="">Add to trip…</option>
+      {trips.map((t) => (
+        <option key={t.id} value={t.id}>{tripTitle(t)}</option>
+      ))}
+    </select>
   )
-}
-
-function PhotoCard({ photo }: { photo: Photo }) {
-  const href = photo.web_key ? photoUrl.web(photo.id) : photoUrl.original(photo.id)
-  return (
-    <figure className={styles.card}>
-      <a href={href} target="_blank" rel="noreferrer">
-        {photo.thumb_key ? (
-          <img src={photoUrl.thumb(photo.id)} loading="lazy" alt={photo.original_filename ?? ''} />
-        ) : (
-          <div className={styles.noimg}>{photo.processing_error ? "Can't preview this file" : 'No preview'}</div>
-        )}
-      </a>
-      {photo.local_time && <figcaption>{photo.local_time.slice(11, 16)}</figcaption>}
-    </figure>
-  )
-}
-
-// Dates are local calendar days ("2025-07-01"). Formatting them in UTC stops the
-// browser's own timezone from shifting them to the day before.
-const dayFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' })
-const rangeFormat = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
-
-function formatDay(date: string) {
-  return dayFormat.format(new Date(date))
-}
-
-function dateRange(first: string, last: string) {
-  return first === last ? rangeFormat.format(new Date(first)) : rangeFormat.formatRange(new Date(first), new Date(last))
 }
