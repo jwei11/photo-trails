@@ -6,10 +6,12 @@ from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI, HTTPException, Response, UploadFile
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import imports, objects, storage, trip_store
 
@@ -29,6 +31,8 @@ app = FastAPI(lifespan=lifespan)
 api = APIRouter(prefix="/api")
 
 STATIC_DIR = Path(__file__).parent / "static"
+# The React app, built by `npm run build` in frontend/.
+FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
 
 @app.get("/healthz")
@@ -36,8 +40,9 @@ def healthz():
     return {"status": "ok"}
 
 
-@app.get("/", include_in_schema=False)
-def timeline_page():
+# The Phase 1 page, kept until the React app covers all of its features.
+@app.get("/old", include_in_schema=False)
+def old_page():
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -362,3 +367,41 @@ def delete_offset(offset_id: uuid.UUID):
 
 # Registered last: include_router copies the routes defined on `api` at the moment it runs.
 app.include_router(api)
+
+
+# The React app is whatever the router couldn't match. Handling it here, after routing,
+# rather than with a catch-all route keeps FastAPI's own behaviour for API paths: the
+# trailing-slash redirect (/api/photos/) and 405 for a wrong method both happen first.
+@app.exception_handler(StarletteHTTPException)
+async def frontend_or_error(request: Request, exc: StarletteHTTPException):
+    path = request.url.path
+    is_api = path == "/api" or path.startswith("/api/")
+    if exc.status_code == 404 and request.method in ("GET", "HEAD") and not is_api:
+        return _frontend(path.lstrip("/"))
+    # Everything else, including unknown /api paths, keeps the normal JSON error: answering
+    # a bad API call with the app's HTML would hide the bug.
+    return await http_exception_handler(request, exc)
+
+
+def _frontend(path: str) -> Response:
+    """A real file from the build as is; for any other URL, index.html, so the browser
+    loads the app and React Router picks the page from the URL."""
+    dist = FRONTEND_DIST.resolve()
+    if not (dist / "index.html").is_file():
+        return JSONResponse(
+            {"detail": "Frontend not built: run `npm run build` in frontend/"}, status_code=404
+        )
+    try:
+        file = (dist / path).resolve()
+        # resolve() collapses ../ segments; the check keeps requests inside the build folder.
+        found = bool(path) and file.is_relative_to(dist) and file.is_file()
+    except (OSError, ValueError):  # e.g. a null byte (/%00) or a name too long for the OS
+        found = False
+    if found:
+        # Vite puts a content hash in every asset's filename, so a changed file gets a new
+        # URL and an asset can be cached forever.
+        if file.is_relative_to(dist / "assets"):
+            return FileResponse(file, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+        return FileResponse(file)
+    # index.html names the current hashed assets, so the browser must re-check it every time.
+    return FileResponse(dist / "index.html", headers={"Cache-Control": "no-cache"})

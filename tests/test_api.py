@@ -40,7 +40,10 @@ def add_offset(client, **overrides):
 
 def test_api_is_under_prefix_and_healthz_is_not(client):
     assert client.get("/api/photos").status_code == 200
-    assert client.get("/photos").status_code == 404
+    # The old root path is now a page URL: it gets the React app (or a 404 if it isn't
+    # built), never the API's JSON.
+    old = client.get("/photos")
+    assert old.status_code == 404 or "text/html" in old.headers["content-type"]
     assert client.get("/healthz").json() == {"status": "ok"}
 
 

@@ -14,7 +14,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000 for the timeline, or http://localhost:8000/docs for the API.
+The frontend is a React app in `frontend/` (needs Node 20.19+ or 22.12+). For development, run Vite's dev server alongside the API and open http://localhost:5173. It reloads on every save and forwards `/api` to the API on port 8000:
+
+```bash
+cd frontend && npm install && npm run dev
+```
+
+To serve it from the API instead, as in production, build it once with `npm run build` and open http://localhost:8000. The API docs are at http://localhost:8000/docs. The Phase 1 page is still at http://localhost:8000/old until the React app covers all of its features.
 
 Run the tests: `.venv/bin/python -m pytest`. The API tests need their own database, because they wipe it. Create it once with `docker compose exec db sh -c 'createdb -U $POSTGRES_USER trips_test'` and set `TEST_DATABASE_URL` in `.env`. Without it, those tests are skipped.
 
@@ -124,6 +130,8 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Frontend libraries: React Router, TanStack Query, CSS Modules, in `frontend/`.** The React project is its own folder at the repo root with its own `package.json`, so the Python package stays Python-only. React Router maps page URLs to components; it's the standard choice. TanStack Query owns every API call: it caches responses, tracks loading and error states, refetches data after an edit changes it, and can poll, which M8's import progress needs. CSS Modules are plain CSS files whose class names are scoped to one component automatically, so styles can't leak between components. Rejected: TanStack Router (type-checked routes, but newer and more to learn), hand-written `fetch` in `useEffect` (every component re-implements loading, errors, and refetching), and Tailwind (fast once learned, but utility classes crowd the markup and add a second styling language to learn alongside React).
 
+**FastAPI sends `index.html` for any URL that isn't the API or a built file.** React Router picks the page from the URL in the browser, but a reload or a pasted link to `/trips/abc` asks the server for that path first. So when routing finds nothing for a GET or HEAD, FastAPI's 404 handler serves the real file from `frontend/dist` if there is one, and `index.html` otherwise. It hooks in after routing rather than being a catch-all route, which a first version did, and review caught two bugs in it. A catch-all matches every path, so FastAPI's own routing answers never happened (`/api/photos/` stopped redirecting to `/api/photos`, and a POST there got 405 instead). It also crashed with a 500 on a URL containing a null byte (`/%00`), which the handler treats as just another page URL. Unknown `/api/...` paths still get a JSON 404, because answering a bad API call with a web page would hide the bug. Paths are resolved and checked to stay inside the build folder (`/%2e%2e/` arrives decoded as `../`; tested). Vite puts a content hash in asset filenames (`index-CiJeS6AA.js`), so assets are cached for a year, while `index.html`, which names the current hashes, is re-checked on every load. A deploy is then picked up on the next page load without anyone clearing their cache.
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -180,6 +188,7 @@ The one duplicate in the first run was real: two generated screenshots were byte
 
 ## Known gaps
 
+- The React app so far only shows the timeline. Trip edits, imports, cameras, and homes are still on the Phase 1 page at `/old`.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
 - Orphan cleanup (`python -m app.cleanup`) is run by hand. M8's worker will run it on a schedule.
 - `complete` downloads the whole original into API memory to process it. M8 moves this to the worker.

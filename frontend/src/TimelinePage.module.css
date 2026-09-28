@@ -1,0 +1,56 @@
+.section {
+  margin-bottom: 2.5rem;
+}
+
+.section h2 {
+  margin-bottom: 0.25rem;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.error {
+  color: var(--danger);
+}
+
+.day {
+  margin: 1.25rem 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.5rem;
+}
+
+.card {
+  margin: 0;
+}
+
+.card img,
+.noimg {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.noimg {
+  display: grid;
+  place-items: center;
+  padding: 0.5rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.card figcaption {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.2rem;
+}
