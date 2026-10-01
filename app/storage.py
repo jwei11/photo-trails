@@ -387,10 +387,30 @@ class OffsetOverlapError(Exception):
     pass
 
 
-def add_offset(values: dict) -> dict:
+def add_offset(values: dict, replace_overlapping: bool = False) -> dict:
+    """Add a clock offset. With replace_overlapping, the camera's offsets covering any of the
+    same camera-clock times are deleted first, in the same transaction: either the new
+    offset replaces them, or (if anything fails) they're all still there."""
     try:
         with engine.begin() as conn:
             lock_writes(conn)
+            replaced = 0
+            if replace_overlapping:
+                # The same test as the exclusion constraint, so exactly the rows that would
+                # block the insert are removed. NULL bounds make a range unbounded.
+                replaced = conn.execute(
+                    text(
+                        """
+                        DELETE FROM camera_clock_offsets
+                        WHERE camera_make = :camera_make AND camera_model = :camera_model
+                          AND coalesce(camera_serial, '')
+                              = coalesce(CAST(:camera_serial AS text), '')
+                          AND tsrange(valid_from, valid_to) && tsrange(
+                              CAST(:valid_from AS timestamp), CAST(:valid_to AS timestamp))
+                        """
+                    ),
+                    values,
+                ).rowcount
             row = conn.execute(
                 text(
                     """
@@ -410,7 +430,7 @@ def add_offset(values: dict) -> dict:
         if isinstance(exc.orig, psycopg.errors.ExclusionViolation):
             raise OffsetOverlapError from exc
         raise
-    return {**dict(row._mapping), "photos_updated": changed}
+    return {**dict(row._mapping), "photos_updated": changed, "replaced": replaced}
 
 
 def delete_offset(offset_id: str) -> int | None:

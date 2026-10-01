@@ -30,7 +30,6 @@ app = FastAPI(lifespan=lifespan)
 # collide with API routes. /healthz stays at the root: it's for infrastructure.
 api = APIRouter(prefix="/api")
 
-STATIC_DIR = Path(__file__).parent / "static"
 # The React app, built by `npm run build` in frontend/.
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
@@ -38,12 +37,6 @@ FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
-
-
-# The Phase 1 page, kept until the React app covers all of its features.
-@app.get("/old", include_in_schema=False)
-def old_page():
-    return FileResponse(STATIC_DIR / "index.html")
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
@@ -331,6 +324,9 @@ class ClockOffsetIn(BaseModel):
     valid_from: datetime | None = None
     valid_to: datetime | None = None
     note: str | None = Field(default=None, max_length=500)
+    # Replace the camera's offsets that cover any of the same times, atomically, instead
+    # of rejecting the overlap with 409.
+    replace_overlapping: bool = False
 
     @model_validator(mode="after")
     def _range_order(self):
@@ -350,11 +346,15 @@ def list_offsets():
 @api.post("/camera-offsets", status_code=201)
 def add_offset(body: ClockOffsetIn):
     try:
-        return storage.add_offset(body.model_dump())
+        values = body.model_dump(exclude={"replace_overlapping"})
+        return storage.add_offset(values, replace_overlapping=body.replace_overlapping)
     except storage.OffsetOverlapError:
         raise HTTPException(
             status_code=409,
-            detail="This camera already has an offset covering these dates. Remove it first.",
+            detail=(
+                "This camera already has an offset covering these dates. "
+                "Remove it, or send replace_overlapping to replace it."
+            ),
         )
 
 

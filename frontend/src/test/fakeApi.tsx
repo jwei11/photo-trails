@@ -6,13 +6,14 @@ import { vi } from 'vitest'
 import type { Photo, Timeline, TimelineTrip } from '../api.ts'
 
 export type Call = { method: string; path: string; body: unknown }
-type Reply = { status: number; body?: unknown }
+export type Reply = { status: number; body?: unknown }
 
 /**
- * Replaces fetch with a fake server. `timeline` answers GET /api/timeline; any other
- * request is recorded in `calls` and answered by `reply` (204 No Content by default).
+ * Replaces fetch with a fake server: every request is recorded in `calls` and answered
+ * by `reply`. GETs listed in `data` (by path) answer 200 with that body; anything else
+ * goes to `reply` (204 No Content by default).
  */
-export function fakeApi(timeline: Timeline, reply: (call: Call) => Reply = () => ({ status: 204 })) {
+export function stubApi(data: Record<string, unknown>, reply: (call: Call) => Reply = () => ({ status: 204 })) {
   const calls: Call[] = []
   vi.stubGlobal('fetch', vi.fn(async (url: string, options: RequestInit = {}) => {
     const call = {
@@ -21,14 +22,20 @@ export function fakeApi(timeline: Timeline, reply: (call: Call) => Reply = () =>
       body: options.body ? JSON.parse(options.body as string) : undefined,
     }
     calls.push(call)
-    const { status, body } = call.method === 'GET' && url === '/api/timeline' ? { status: 200, body: timeline } : reply(call)
+    const { status, body } = call.method === 'GET' && url in data ? { status: 200, body: data[url] } : reply(call)
     return new Response(status === 204 ? null : JSON.stringify(body), { status })
   }))
   return {
     calls,
     edits: () => calls.filter((c) => c.method !== 'GET'),
-    timelineLoads: () => calls.filter((c) => c.path === '/api/timeline').length,
+    loads: (path: string) => calls.filter((c) => c.method === 'GET' && c.path === path).length,
   }
+}
+
+/** A fake server for the timeline page. */
+export function fakeApi(timeline: Timeline, reply?: (call: Call) => Reply) {
+  const api = stubApi({ '/api/timeline': timeline }, reply)
+  return { ...api, timelineLoads: () => api.loads('/api/timeline') }
 }
 
 /** Renders a component with its own fresh cache, as the app would. */

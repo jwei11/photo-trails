@@ -1,6 +1,7 @@
 import io
 
 import httpx
+import pytest
 from PIL import Image, TiffImagePlugin
 
 from app.exif import IFD_EXIF, IFD_GPS
@@ -95,6 +96,39 @@ def test_overlapping_clock_offsets_are_rejected(client):
     assert res.status_code == 409
     assert "already has an offset" in res.json()["detail"]
     assert len(client.get("/api/camera-offsets").json()) == 1
+
+
+def test_replacing_removes_only_the_overlapping_offsets(client):
+    assert add_offset(client, valid_to="2025-07-02T00:00:00").status_code == 201
+    kept = add_offset(client, valid_from="2025-07-05T00:00:00").json()
+    assert add_offset(client, camera_serial="OTHER").status_code == 201
+
+    res = add_offset(client, valid_from="2025-07-01T00:00:00", valid_to="2025-07-03T00:00:00",
+                     offset_seconds=-1800, replace_overlapping=True)
+    assert res.status_code == 201
+    assert res.json()["replaced"] == 1
+
+    offsets = {(o["camera_serial"], o["valid_from"], o["offset_seconds"]) for o in client.get("/api/camera-offsets").json()}
+    assert offsets == {
+        ("FX1", "2025-07-01T00:00:00", -1800),  # the new one, replacing the one ending Jul 2
+        ("FX1", kept["valid_from"], 3600),  # doesn't overlap: kept
+        ("OTHER", None, 3600),  # another camera: untouched
+    }
+
+
+def test_a_failed_replace_keeps_the_old_offset(client, monkeypatch):
+    from app import storage
+
+    assert add_offset(client).status_code == 201
+
+    def broken(conn):
+        raise RuntimeError("recompute failed")
+
+    monkeypatch.setattr(storage, "resolve_times", broken)  # fails after the delete and insert
+    with pytest.raises(RuntimeError):
+        add_offset(client, offset_seconds=-600, replace_overlapping=True)
+
+    assert [o["offset_seconds"] for o in client.get("/api/camera-offsets").json()] == [3600]
 
 
 def test_adjacent_offset_ranges_and_other_cameras_are_allowed(client):

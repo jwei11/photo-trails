@@ -10,11 +10,8 @@ export const importEngine = new ImportEngine({
   ...importsApi,
   put: putWithProgress,
   sha256: sha256Hex,
-  onChanged: () => {
-    // New photos change the timeline and the import history.
-    queryClient.invalidateQueries({ queryKey: ['timeline'] })
-    queryClient.invalidateQueries({ queryKey: ['imports'] })
-  },
+  // New photos change the timeline, the import history, and the camera list.
+  onChanged: () => queryClient.invalidateQueries(),
 })
 
 /** The current import state; the component re-renders whenever it changes. */

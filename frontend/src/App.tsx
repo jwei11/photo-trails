@@ -2,6 +2,7 @@ import { Link, NavLink, Route, Routes } from 'react-router'
 import styles from './App.module.css'
 import ImportPage from './imports/ImportPage.tsx'
 import { useImport } from './imports/useImport.ts'
+import SettingsPage from './settings/SettingsPage.tsx'
 import TimelinePage from './TimelinePage.tsx'
 
 export default function App() {
@@ -12,6 +13,7 @@ export default function App() {
         <nav className={styles.nav}>
           <NavLink to="/" end>Timeline</NavLink>
           <NavLink to="/import">Import</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
           <ImportIndicator />
         </nav>
       </header>
@@ -19,6 +21,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<TimelinePage />} />
           <Route path="/import" element={<ImportPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<p>Page not found.</p>} />
         </Routes>
       </main>

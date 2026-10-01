@@ -8,8 +8,8 @@ import TripSection from './TripSection.tsx'
 import { useEdit } from './useEdit.ts'
 
 export default function TimelinePage() {
-  // The key names this data in the shared cache; useEdit invalidates ['timeline'] after
-  // every edit, which refetches it here.
+  // The key names this data in the shared cache. After any edit, useEdit marks the cache
+  // stale, and this refetches.
   const { data, isPending, error } = useQuery({
     queryKey: ['timeline'],
     queryFn: () => api<Timeline>('/timeline'),

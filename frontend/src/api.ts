@@ -129,6 +129,41 @@ export const importsApi = {
     send<ImportItem>('POST', `/imports/${importId}/items/${itemId}/failed`, { error: error.slice(0, 500) }),
 }
 
+// A camera is identified by make + model + serial; clock offsets match all three exactly.
+export type CameraId = { camera_make: string; camera_model: string; camera_serial: string | null }
+
+export type Camera = CameraId & {
+  photo_count: number
+  // The camera's own clock readings (no timezone): the range a correction can cover.
+  first_camera_time: string | null
+  last_camera_time: string | null
+}
+
+export type ClockOffset = CameraId & {
+  id: string
+  offset_seconds: number // added to the camera's clock: positive if it was behind
+  // Camera-clock times, half-open [from, to); null means unbounded on that side.
+  valid_from: string | null
+  valid_to: string | null
+  note: string | null
+}
+
+export type NewClockOffset = Omit<ClockOffset, 'id'>
+
+export type Home = { id: string; name: string; lat: number; lon: number; radius_km: number }
+
+export const settingsApi = {
+  cameras: () => api<Camera[]>('/cameras'),
+  offsets: () => api<ClockOffset[]>('/camera-offsets'),
+  // Without replace, an offset overlapping an existing one for the camera fails with 409.
+  addOffset: (offset: NewClockOffset, replace = false) =>
+    send<ClockOffset>('POST', '/camera-offsets', { ...offset, replace_overlapping: replace }),
+  removeOffset: (id: string) => send('DELETE', `/camera-offsets/${id}`),
+  homes: () => api<Home[]>('/homes'),
+  addHome: (home: Omit<Home, 'id'>) => send<Home>('POST', '/homes', home),
+  removeHome: (id: string) => send('DELETE', `/homes/${id}`),
+}
+
 export const photoUrl = {
   thumb: (id: string) => `/api/photos/${id}/thumb`,
   web: (id: string) => `/api/photos/${id}/web`,
