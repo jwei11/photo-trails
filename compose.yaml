@@ -15,20 +15,21 @@ services:
       timeout: 3s
       retries: 15
 
-  # S3-compatible object store for local development. MinIO stopped publishing
+  # S3-compatible object store for tests and offline development. MinIO stopped publishing
   # images in 2025; SeaweedFS only publishes `latest`, so pin the exact digest.
   objects:
     image: chrislusf/seaweedfs@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     environment:
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      # Its own credentials, separate from the app's S3_* ones, which may be AWS keys.
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY}
     # Credentials are written from env vars at start, so no secret lives in a committed file.
     entrypoint:
       - sh
       - -c
       - |
         printf '{"identities":[{"name":"app","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' \
-          "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY" > /tmp/s3.json
+          "$$SEAWEEDFS_ACCESS_KEY" "$$SEAWEEDFS_SECRET_KEY" > /tmp/s3.json
         exec weed server -dir=/data -s3 -s3.port=8333 -s3.config=/tmp/s3.json \
           -master.volumeSizeLimitMB=256 -volume.max=40 -ip.bind=0.0.0.0
     ports:

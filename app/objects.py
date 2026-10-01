@@ -10,16 +10,26 @@ UPLOAD_URL_TTL = 15 * 60
 DOWNLOAD_URL_TTL = 60 * 60
 
 
-@cache
-def _client(endpoint: str):
+def client(endpoint: str | None, access_key: str, secret_key: str, region: str):
+    """An S3 client for Amazon S3 (endpoint None) or an S3-compatible store at `endpoint`."""
     return boto3.client(
         "s3",
         endpoint_url=endpoint,
-        aws_access_key_id=config.S3_ACCESS_KEY,
-        aws_secret_access_key=config.S3_SECRET_KEY,
-        region_name=config.S3_REGION,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=Config(
+            signature_version="s3v4",
+            # S3 itself uses bucket.s3.region.amazonaws.com; a local store like SeaweedFS
+            # has no per-bucket hostnames, so the bucket goes in the path: host/bucket/key.
+            s3={"addressing_style": "path" if endpoint else "virtual"},
+        ),
     )
+
+
+@cache
+def _client(endpoint: str | None):
+    return client(endpoint, config.S3_ACCESS_KEY, config.S3_SECRET_KEY, config.S3_REGION)
 
 
 def _internal():
@@ -32,23 +42,50 @@ def _signer():
     return _client(config.S3_PUBLIC_ENDPOINT)
 
 
-def ensure_bucket() -> None:
+class StorageUnavailable(Exception):
+    pass
+
+
+def setup_bucket() -> None:
+    """At startup: create and configure the bucket if the app manages it (local SeaweedFS),
+    otherwise check the app can reach it, so a misconfiguration fails now, not mid-upload."""
     s3 = _internal()
+    if config.S3_MANAGE_BUCKET:
+        try:
+            s3.head_bucket(Bucket=config.S3_BUCKET)
+        except ClientError:
+            s3.create_bucket(Bucket=config.S3_BUCKET)
+        s3.put_bucket_cors(
+            Bucket=config.S3_BUCKET,
+            CORSConfiguration={
+                "CORSRules": [{
+                    "AllowedOrigins": config.APP_ORIGINS,
+                    "AllowedMethods": ["PUT", "GET"],
+                    "AllowedHeaders": ["content-type"],
+                    "MaxAgeSeconds": 3600,
+                }]
+            },
+        )
+        return
     try:
-        s3.head_bucket(Bucket=config.S3_BUCKET)
-    except ClientError:
-        s3.create_bucket(Bucket=config.S3_BUCKET)
-    s3.put_bucket_cors(
-        Bucket=config.S3_BUCKET,
-        CORSConfiguration={
-            "CORSRules": [{
-                "AllowedOrigins": [config.APP_ORIGIN],
-                "AllowedMethods": ["PUT", "GET"],
-                "AllowedHeaders": ["content-type"],
-                "MaxAgeSeconds": 3600,
-            }]
-        },
-    )
+        found = s3.head_bucket(Bucket=config.S3_BUCKET)
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        hint = {
+            301: f"the bucket is in a different region than S3_REGION={config.S3_REGION}",
+            403: "the credentials are wrong, or their policy doesn't allow s3:ListBucket on it",
+            404: "no bucket has that name",
+        }.get(status, str(exc))
+        raise StorageUnavailable(f"Can't reach bucket {config.S3_BUCKET!r}: {hint}.") from exc
+    # boto3 quietly follows S3's redirect to a bucket's real region for its own calls, so a
+    # wrong S3_REGION gets this far. But presigned URLs are signed for S3_REGION, and S3
+    # rejects every one of them: check explicitly.
+    region = found.get("BucketRegion") or found["ResponseMetadata"]["HTTPHeaders"].get("x-amz-bucket-region")
+    if region and region != config.S3_REGION:
+        raise StorageUnavailable(
+            f"Bucket {config.S3_BUCKET!r} is in {region}, but S3_REGION={config.S3_REGION}: "
+            "browser upload and download links would all be rejected. Set S3_REGION to the bucket's region."
+        )
 
 
 def put(key: str, data: bytes, content_type: str) -> None:

@@ -1,15 +1,30 @@
 import os
+from urllib.parse import urlparse
 
 import pytest
 from dotenv import load_dotenv
 
 load_dotenv()
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+TEST_S3_ENDPOINT = os.environ.get("TEST_S3_ENDPOINT", "http://localhost:8333")
 
-# Must happen before app.config is imported, so the app never points at the real database.
+# API tests delete every object in their bucket, so they only ever run against the local
+# SeaweedFS, never the S3 bucket the app uses in development. Checked before anything else.
+if urlparse(TEST_S3_ENDPOINT).hostname not in ("localhost", "127.0.0.1"):
+    raise pytest.UsageError(f"TEST_S3_ENDPOINT must be a local store, not {TEST_S3_ENDPOINT}")
+
+# Must happen before app.config is imported, so the app never points at real data.
+os.environ.update({
+    "S3_ENDPOINT": TEST_S3_ENDPOINT,
+    "S3_PUBLIC_ENDPOINT": TEST_S3_ENDPOINT,
+    "S3_ACCESS_KEY": os.environ.get("SEAWEEDFS_ACCESS_KEY", ""),
+    "S3_SECRET_KEY": os.environ.get("SEAWEEDFS_SECRET_KEY", ""),
+    "S3_REGION": "us-east-1",
+    "S3_BUCKET": os.environ.get("TEST_S3_BUCKET", "photos-test"),
+    "S3_MANAGE_BUCKET": "true",
+})
 if TEST_DATABASE_URL:
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
-    os.environ["S3_BUCKET"] = os.environ.get("TEST_S3_BUCKET", "photos-test")
 
 
 @pytest.fixture(scope="session")

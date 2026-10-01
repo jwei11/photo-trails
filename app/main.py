@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await run_in_threadpool(objects.ensure_bucket)
+    await run_in_threadpool(objects.setup_bucket)
     yield
 
 

@@ -7,8 +7,8 @@ Built milestone by milestone following [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md
 ## Setup
 
 ```bash
-cp .env.example .env            # then set a real password
-docker compose up -d --wait db objects  # Postgres + PostGIS, and S3-compatible storage
+cp .env.example .env            # then set real passwords and your bucket (below)
+docker compose up -d --wait db objects  # Postgres + PostGIS, and local S3-compatible storage
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/alembic upgrade head  # apply migrations
 .venv/bin/uvicorn app.main:app --reload
@@ -22,7 +22,9 @@ cd frontend && npm install && npm run dev
 
 To serve it from the API instead, as in production, build it once with `npm run build` and open http://localhost:8000. The API docs are at http://localhost:8000/docs.
 
-Run the tests: `.venv/bin/python -m pytest`. The API tests need their own database, because they wipe it. Create it once with `docker compose exec db sh -c 'createdb -U $POSTGRES_USER trips_test'` and set `TEST_DATABASE_URL` in `.env`. Without it, those tests are skipped.
+**Photo storage** is an Amazon S3 bucket, set up once in the AWS console, before anything else: a billing budget (the Zero spend template plus a small monthly one), then a bucket in `S3_REGION` with Block all public access on, a CORS rule allowing `GET` and `PUT` with a `content-type` header from `http://localhost:5173` and `http://localhost:8000`, and an IAM user whose only permissions are `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on its objects. Put that user's access key in `.env`. The app checks it can reach the bucket at startup and says why if it can't. To work fully offline instead, point the `S3_*` settings at the local SeaweedFS (see `.env.example`). To copy photos from SeaweedFS into the bucket: `.venv/bin/python -m app.copy_storage --dry-run`, then without `--dry-run`. It's safe to re-run and never deletes anything.
+
+Run the tests: `.venv/bin/python -m pytest`. They always use the local SeaweedFS, never S3, and refuse to start if `TEST_S3_ENDPOINT` points anywhere else, because the API tests empty their bucket. The API tests need their own database, because they wipe it. Create it once with `docker compose exec db sh -c 'createdb -U $POSTGRES_USER trips_test'` and set `TEST_DATABASE_URL` in `.env`. Without it, those tests are skipped.
 
 Frontend tests: `cd frontend && npm test`. They render components in a simulated browser with a fake API, so they need neither the server nor the database.
 
@@ -124,6 +126,14 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Two S3 endpoints: one the API uses, one baked into signed URLs.** A presigned URL's signature covers its hostname. Once the API runs in Docker (M10), it reaches storage at an internal name (`objects:8333`) that browsers can't resolve, while browsers need `localhost:8333` or a public domain. Signing with the internal client would produce URLs that are valid but unreachable. `S3_ENDPOINT` and `S3_PUBLIC_ENDPOINT` are the same today, and configured separately from the start.
 
+**Photos move to Amazon S3; development uses a real dev bucket, and tests stay on SeaweedFS.** Phase 1 used SeaweedFS for everything. Using a real S3 bucket during development means IAM permissions, CORS, and request signing are exercised now, not discovered all at once at deploy time. Each environment gets its own bucket (a dev bucket now, a production one at M12), so development can never touch production photos. Tests keep using a local SeaweedFS bucket: they wipe it, run in seconds, cost nothing, and will run in CI without AWS credentials. Rejected: SeaweedFS until deploy (no AWS cost now, but every S3 difference surfaces during M12) and S3 for tests too (slow, costs money, and CI would need AWS keys). The region is us-east-2 (Ohio). Oregon (us-west-2) is closer, but AWS's free plan doesn't offer it; using it would mean switching to a paid plan, which can wait until the M12 deploy. The extra ~60 ms per request from California doesn't matter for loading photos, and what will matter at M12 is putting the server in the same region as the bucket. The startup check compares the bucket's real region with `S3_REGION`: boto3 quietly follows S3's redirect to the right region for its own calls, so a mismatch otherwise surfaces only as every browser link failing (it happened while setting this up).
+
+**The bucket and its CORS rule are set up outside the app.** On S3 the app's credentials can only read, write, list, and delete objects in its one bucket; it can't create buckets or change their settings, so a leaked key can't make the bucket public or rewrite its CORS rule. The bucket is created in the AWS console now (Block Public Access on, ACLs disabled, SSE-S3 encryption) and moves to Terraform in M12. At startup the app only checks that it can reach its bucket and stops with a clear error if not. Against SeaweedFS the app still creates the bucket and its CORS rule itself, as a local convenience. Rejected: the app configuring the bucket at startup (as in Phase 1), which needs `s3:CreateBucket` and `s3:PutBucketCORS` on the app's own keys.
+
+**The app authenticates as an IAM user limited to one bucket.** Its access keys live in `.env` (never committed). The policy allows `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on its objects, nothing else. Presigned URLs carry this user's permissions, so a browser holding one can do exactly one operation on one key until it expires. Rejected: IAM Identity Center (short-lived credentials from `aws sso login`, safer on a laptop, but more setup, and the M12 deploy to a non-AWS VM still needs another approach). Long-lived keys are the main risk: if one leaks, deactivate it in IAM and create a new one.
+
+**Existing photos are copied to S3 with the same keys.** Database rows store each object's key, not its location, so copying every object to the same key in the new bucket keeps every row valid with no migration. The copy script runs as a dry run first and never deletes from the source. Rejected: starting with an empty bucket (existing photos' images would break).
+
 **The frontend is a React single-page app built with Vite.** Phase 1's single plain-JS page was fine for lists and buttons, but the M9 map and timeline scrubber need shared state across many interactive parts, which is what React is for. Vite compiles the app to static files, so FastAPI stays the only backend. Rejected: Next.js (its server rendering helps search engines and first loads on public pages, but it adds a Node server beside FastAPI, and Leaflet needs the browser's `window`, so map components would need client-only workarounds) and staying with plain JS (the map would be hand-written DOM updates).
 
 **TypeScript, not JavaScript.** API responses have many nullable fields (a photo may have no `shot_at`, no coordinates, no trip), and types make the compiler catch a forgotten null check or a misspelled field before the page runs. Rejected: plain JavaScript (less to learn up front, but those mistakes show up as blank UI at runtime).
@@ -210,7 +220,7 @@ The one duplicate in the first run was real: two generated screenshots were byte
 - The browser reads each file fully into memory to hash it (Web Crypto has no streaming hash). Fine for photos, but a 200 MB file briefly costs 200 MB of browser memory. Hashing also needs a secure context (HTTPS or localhost).
 - Trips are still regrouped after every photo in an import, not once at the end. M8 changes that.
 - Import items that are never uploaded stay `uploading` forever (their pending photo is swept after an hour). The import history shows them as "not uploaded", and they can be resumed by picking the files again.
-- SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them. The app sets an explicit CORS rule for `APP_ORIGIN` on startup, so production behaves correctly, but locally the permissive default hides mistakes in that rule.
+- SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them unless the bucket's CORS rule allows the origin. The app sets an explicit rule on SeaweedFS too, but the permissive default means offline development and tests can't catch a mistake in it. The S3 bucket's rule is set by hand in the console until M12 moves it to Terraform, so it can drift from `APP_ORIGINS`.
 - RAW files and video aren't decoded: they're stored, with no metadata or previews.
 - A wall-clock time in the repeated hour when clocks fall back is ambiguous. We take the first occurrence. Only a recorded offset or GPS time can disambiguate it.
 - Some cameras write a stale GPS timestamp (from the last fix, not the shot), so `gps` is trusted below the recorded offset.
