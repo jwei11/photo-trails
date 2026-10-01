@@ -136,6 +136,8 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Frontend tests use Vitest and React Testing Library.** Vitest is Vite's own test runner, so tests compile TypeScript and CSS Modules exactly as the app does, with no separate configuration. Testing Library renders a component and drives it the way a user would: find the button by its label, click it, check which API request went out and what the page shows afterwards. Tests don't depend on internal state or markup structure, so refactoring a component doesn't break them. Rejected: no frontend tests until CI in M12 (the backend's tests can't see a button that sends the wrong request) and Jest (the long-time default, but it needs its own TypeScript and CSS setup alongside Vite's).
 
+**A running import lives in an engine outside React, on its own `/import` page.** An import is a process, not a page of data: it hashes files, registers the batch, and runs four uploads at a time for minutes, and the browser holds the `File` objects the server never sees. `frontend/src/imports/importEngine.ts` is a plain TypeScript class that owns all of that and publishes an immutable snapshot of its state on every change. Components subscribe with React's `useSyncExternalStore`, so they re-render when the snapshot changes. Because the engine isn't a component, leaving the import page mid-import doesn't lose anything: uploads continue, the header shows progress on every page, and coming back shows the full state. Its network, hashing, and upload functions are passed in, so tests drive it with fakes and no rendering. Rejected: state in the import component with `useReducer` (simplest, but navigating away unmounts it and throws away the progress of uploads that are still running) and Zustand (a small library that does the same with less code, but it hides the subscribe mechanism this is meant to show).
+
 **Phase 2 order: React, then S3, then M7–M9.** The guide places the frontend switch at M9's map. Moving it to the start means M7's place names and M8's import progress are built once, in React, instead of in the old page first. S3 comes next because it's mostly configuration, and M8 may use SQS, which needs the same AWS account set up with a billing alarm.
 
 ## Performance baseline (M3, synchronous processing)
@@ -194,7 +196,8 @@ The one duplicate in the first run was real: two generated screenshots were byte
 
 ## Known gaps
 
-- The React app has the timeline and trip edits so far. Imports, cameras and clock offsets, and homes are still on the Phase 1 page at `/old`.
+- The React app has the timeline, trip edits, and imports so far. Cameras and clock offsets, and homes, are still on the Phase 1 page at `/old`.
+- A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
 - Orphan cleanup (`python -m app.cleanup`) is run by hand. M8's worker will run it on a schedule.
 - `complete` downloads the whole original into API memory to process it. M8 moves this to the worker.
