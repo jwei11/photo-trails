@@ -2,7 +2,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.trips import Home, LockedTrip, TripPhoto, group_photos, haversine_km, trip_stats
+from app.trips import (
+    Home, LockedTrip, PlacedPhoto, TripPhoto, group_photos, haversine_km, place_summary, trip_stats,
+)
 
 HOME = (37.77, -122.42)  # San Francisco
 NEAR_HOME = (37.80, -122.27)  # Oakland, ~14 km
@@ -166,3 +168,35 @@ def test_trip_stats():
     assert s.start == at(1, 10) and s.end == at(2, 10)
     assert s.distance_km == pytest.approx(503, abs=3)
     assert s.bbox == (*LISBON, *MADRID)  # Lisbon is south-west of Madrid
+
+
+def placed(day, hour, place_id, place, country_code, country):
+    when = datetime(2025, 7, day, hour, tzinfo=timezone.utc)
+    return PlacedPhoto(when, when.date(), place_id, place, country_code, country)
+
+
+def test_place_summary_counts_days_per_country_and_orders_by_first_visit():
+    photos = [
+        placed(2, 18, 2, "Madrid", "ES", "Spain"),  # travel day: Lisbon, then Madrid
+        placed(1, 10, 1, "Lisbon", "PT", "Portugal"),
+        placed(2, 9, 1, "Lisbon", "PT", "Portugal"),
+        placed(1, 15, 3, "Sintra", "PT", "Portugal"),
+        PlacedPhoto(None, None, 1, "Lisbon", "PT", "Portugal"),  # undated: counts as a photo, not a day
+    ]
+
+    summary = place_summary(photos)
+
+    assert summary["countries"] == [
+        {"code": "PT", "name": "Portugal", "days": 2},
+        {"code": "ES", "name": "Spain", "days": 1},  # Jul 2 counts for both countries
+    ]
+    assert summary["places"] == [
+        {"name": "Lisbon", "country_code": "PT", "photos": 3},
+        {"name": "Sintra", "country_code": "PT", "photos": 1},
+        {"name": "Madrid", "country_code": "ES", "photos": 1},
+    ]
+
+
+def test_place_summary_of_photos_without_location_is_empty():
+    photos = [PlacedPhoto(datetime(2025, 7, 1, tzinfo=timezone.utc), None, None, None, None, None)]
+    assert place_summary(photos) == {"countries": [], "places": []}

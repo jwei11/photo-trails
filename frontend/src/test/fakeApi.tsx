@@ -67,6 +67,12 @@ export function photo(id: string, overrides: Partial<Photo> = {}): Photo {
     web_key: `${id}_web.webp`,
     processing_error: null,
     trip_id: null,
+    place_name: 'Lisbon',
+    nearest_place_name: 'Baixa',
+    region_name: 'Lisbon',
+    country_name: 'Portugal',
+    country_code: 'PT',
+    place_distance_m: 337,
     ...overrides,
   }
 }
@@ -89,6 +95,8 @@ export function trip(id: string, photos: Photo[], overrides: Partial<TimelineTri
     bbox: null,
     days: [...days].map(([date, ps]) => ({ date, photos: ps })),
     undated: [],
+    countries: [],
+    places: [],
     ...overrides,
   }
 }

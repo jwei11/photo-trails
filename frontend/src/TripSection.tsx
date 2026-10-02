@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { tripEdits, type Photo, type TimelineTrip } from './api.ts'
 import DayList from './DayList.tsx'
-import { plural, tripDates, tripTitle } from './format.ts'
+import { countryDays, plural, tripDates, tripTitle } from './format.ts'
 import PhotoGrid from './PhotoGrid.tsx'
 import styles from './TripSection.module.css'
 import { useEdit } from './useEdit.ts'
@@ -14,8 +14,11 @@ export default function TripSection({ trip, next }: Props) {
   const busy = edit.isPending
   const [renaming, setRenaming] = useState(false)
 
+  // Dates go in the stats line whenever the title isn't already the dates.
+  const dates = tripDates(trip)
   const stats = [
-    trip.name ? tripDates(trip) : null,
+    tripTitle(trip) !== dates ? dates : null,
+    countryDays(trip) || null,
     plural(trip.day_count, 'day'),
     plural(trip.photo_count, 'photo'),
     trip.distance_km ? `${Math.round(trip.distance_km).toLocaleString()} km` : null,

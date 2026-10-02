@@ -20,7 +20,13 @@ PHOTO_COLUMNS = """
     camera_make, camera_model, camera_serial, camera_time, exif_offset_min, gps_time,
     lat, lon, altitude_m, width, height, orientation,
     shot_at, tz_name, local_offset_min, time_source,
-    thumb_key, web_key, processing_error, processing_ms, trip_id, trip_pinned
+    thumb_key, web_key, processing_error, processing_ms, trip_id, trip_pinned,
+    place_id, place_distance_m, nearest_place_id, nearest_place_distance_m, country_code,
+    (SELECT name FROM places WHERE geonameid = photos.place_id) AS place_name,
+    (SELECT name FROM places WHERE geonameid = photos.nearest_place_id) AS nearest_place_name,
+    (SELECT r.name FROM places pl JOIN admin1_regions r ON r.code = pl.country_code || '.' || pl.admin1_code
+     WHERE pl.geonameid = photos.place_id) AS region_name,
+    (SELECT name FROM countries WHERE iso_a2 = photos.country_code LIMIT 1) AS country_name
 """
 
 WRITE_LOCK = 3_141_592
@@ -36,8 +42,87 @@ def lock_writes(conn: Connection) -> None:
 
 
 def recompute(conn: Connection) -> None:
+    resolve_places(conn)
     resolve_times(conn)
     regroup_trips(conn)
+
+
+# 12 nautical miles: a country's territorial waters. A photo from a beach or a boat that
+# falls just outside a country's (approximate) coastline still counts as in that country.
+COAST_TOLERANCE_M = 22_224
+
+# Which place a person would name. Each place "claims" a radius that grows with the square
+# root of its population: 20 m x sqrt(population) gives Lisbon (518k) 14 km, a neighbourhood
+# of 12k 2.3 km, a village of 1,000 630 m. The photo gets the place it's deepest inside,
+# relative to that radius, so a big city counts from further out but a small town still
+# wins right next to it. If no radius reaches the photo, it gets the nearest place.
+# Tried against real spots before choosing: see the README.
+PLACE_RADIUS_M_PER_SQRT_PERSON = 20
+PLACE_SEARCH_LIMIT_M = 50_000  # the radius of a city of ~6 million; bigger ones are capped
+
+
+def resolve_places(conn: Connection) -> int:
+    """Match photos not yet checked to a place, their nearest place, and their country.
+
+    Only unchecked photos: a photo's coordinates never change, so its place only needs
+    finding when it arrives, or again after the place data is reloaded (which unchecks all).
+    """
+    return conn.execute(
+        text(
+            """
+            UPDATE photos p
+            SET place_id = coalesce(r.chosen_id, r.nearest_id),
+                place_distance_m = coalesce(r.chosen_distance_m, r.nearest_distance_m),
+                nearest_place_id = r.nearest_id, nearest_place_distance_m = r.nearest_distance_m,
+                country_code = r.country_code, places_checked = true
+            FROM (
+                SELECT ph.id, near.geonameid AS nearest_id, near.distance_m AS nearest_distance_m,
+                       chosen.geonameid AS chosen_id, chosen.distance_m AS chosen_distance_m,
+                       CASE WHEN inside.found THEN inside.iso_a2 ELSE coast.iso_a2 END AS country_code
+                FROM photos ph
+                -- Nearest place: <-> lets the spatial index walk outwards from the point.
+                LEFT JOIN LATERAL (
+                    SELECT geonameid, ST_Distance(pl.location, ph.location) AS distance_m
+                    FROM places pl ORDER BY pl.location <-> ph.location LIMIT 1
+                ) near ON ph.location IS NOT NULL
+                -- The place the photo is deepest inside (see PLACE_RADIUS_M_PER_SQRT_PERSON).
+                -- ST_DWithin uses the index to fetch candidates within the search limit.
+                LEFT JOIN LATERAL (
+                    SELECT geonameid, distance_m FROM (
+                        SELECT geonameid, ST_Distance(pl.location, ph.location) AS distance_m,
+                               :per_sqrt * sqrt(greatest(pl.population, 1)) AS radius_m
+                        FROM places pl WHERE ST_DWithin(pl.location, ph.location, :search_limit)
+                    ) candidates
+                    WHERE distance_m <= radius_m
+                    ORDER BY distance_m / radius_m LIMIT 1
+                ) chosen ON ph.location IS NOT NULL
+                -- The country shape containing the point (geometry: flat lat/lon test).
+                LEFT JOIN LATERAL (
+                    SELECT true AS found, iso_a2 FROM countries c
+                    WHERE ST_Covers(c.geom, ph.location::geometry) LIMIT 1
+                ) inside ON ph.location IS NOT NULL
+                -- Otherwise the nearest country within territorial waters. The bounding-box
+                -- test (&&, about 0.3 degrees) uses the index to pick a few candidates
+                -- before measuring true distances to their shapes.
+                LEFT JOIN LATERAL (
+                    SELECT iso_a2 FROM (
+                        SELECT iso_a2, ST_Distance(c.geom::geography, ph.location) AS d
+                        FROM countries c
+                        WHERE c.geom && ST_Expand(ph.location::geometry, 0.3)
+                    ) candidates
+                    WHERE d <= :coast ORDER BY d LIMIT 1
+                ) coast ON ph.location IS NOT NULL AND inside.found IS NULL
+                -- Only photos whose file has arrived: a pending one has no coordinates yet,
+                -- and checking it now would skip it for good. It's matched in the same
+                -- transaction that makes it ready.
+                WHERE NOT ph.places_checked AND ph.status = 'ready'
+            ) r
+            WHERE p.id = r.id
+            """
+        ),
+        {"coast": COAST_TOLERANCE_M, "per_sqrt": PLACE_RADIUS_M_PER_SQRT_PERSON,
+         "search_limit": PLACE_SEARCH_LIMIT_M},
+    ).rowcount
 
 
 def all_photos() -> list[dict]:

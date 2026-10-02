@@ -4,3 +4,5 @@ __pycache__/
 .env
 uploads/
 .ruff_cache/
+# Downloaded place data (python -m app.geodata load)
+data/

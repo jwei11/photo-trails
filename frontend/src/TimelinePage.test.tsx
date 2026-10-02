@@ -43,6 +43,21 @@ describe('timeline', () => {
     expect(screen.getByText(/with no time information/)).toBeInTheDocument()
   })
 
+  it('titles an unnamed trip by where it went, with the dates and days per country underneath', async () => {
+    fakeApi({
+      ...timeline,
+      trips: [trip('iberia', lisbonPhotos, {
+        places: [{ name: 'Lisbon', country_code: 'PT', photos: 2 }, { name: 'Madrid', country_code: 'ES', photos: 1 }],
+        countries: [{ code: 'PT', name: 'Portugal', days: 2 }, { code: 'ES', name: 'Spain', days: 1 }],
+      })],
+    })
+    renderWithApp(<TimelinePage />)
+
+    const iberia = await tripNamed('Lisbon & Madrid')
+    expect(iberia.getByText(/2 days in Portugal, 1 in Spain/)).toBeInTheDocument()
+    expect(iberia.getByText(/Jul 1 – 2, 2025|1–2 Jul 2025|Jul 1–2, 2025/)).toBeInTheDocument()
+  })
+
   it("offers Split on every dated photo except the trip's first", async () => {
     fakeApi(timeline)
     renderWithApp(<TimelinePage />)

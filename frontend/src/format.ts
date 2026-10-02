@@ -36,6 +36,30 @@ export function tripDates(trip: TimelineTrip) {
   return first && last ? dateRange(first, last) : null
 }
 
+/** "A", "A & B", "A, B & C", or "A, B & 3 more". */
+export function listNames(names: string[], max = 3) {
+  if (names.length <= 1) return names[0] ?? ''
+  if (names.length > max) return `${names.slice(0, 2).join(', ')} & ${names.length - 2} more`
+  return `${names.slice(0, -1).join(', ')} & ${names.at(-1)}`
+}
+
+/** A title from where the trip went: its places if few, otherwise its countries. */
+export function placesTitle(trip: Pick<TimelineTrip, 'places' | 'countries'>) {
+  const places = trip.places.map((p) => p.name)
+  const countries = trip.countries.map((c) => c.name ?? c.code)
+  if (!places.length) return countries.length ? listNames(countries) : null
+  if (places.length <= 2) return listNames(places)
+  return countries.length >= 2 ? listNames(countries) : listNames(places, 2)
+}
+
+/** Your own name for the trip if you gave one; otherwise where it went; otherwise when. */
 export function tripTitle(trip: TimelineTrip) {
-  return trip.name ?? tripDates(trip) ?? 'Untitled trip'
+  return trip.name ?? placesTitle(trip) ?? tripDates(trip) ?? 'Untitled trip'
+}
+
+/** "5 days in Portugal, 2 in Spain". */
+export function countryDays(trip: Pick<TimelineTrip, 'countries'>) {
+  return trip.countries
+    .map((c, i) => `${i === 0 ? plural(c.days, 'day') : c.days} in ${c.name ?? c.code}`)
+    .join(', ')
 }

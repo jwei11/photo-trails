@@ -154,6 +154,27 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Phase 2 order: React, then S3, then M7–M9.** The guide places the frontend switch at M9's map. Moving it to the start means M7's place names and M8's import progress are built once, in React, instead of in the old page first. S3 comes next because it's mostly configuration, and M8 may use SQS, which needs the same AWS account set up with a billing alarm.
 
+**Places come from GeoNames `cities1000`, countries from Natural Earth borders.** `cities1000` lists about 150,000 places with at least 1,000 people, down to villages, with coordinates, population, country, and region codes. It's free, offline, and small enough to load in seconds. The country a photo is in is decided by which Natural Earth country shape contains it, not by the nearest place's country: near a border or a coast, the nearest named place is often across the line. Rejected: `cities15000` (about 30,000 places: rural photos snap to a town 30+ km away) and `cities500` (more obscure places to weight away, for little gain), and a reverse-geocoding API such as Nominatim or Google (rate limits, API keys, cost at volume, and every photo's location sent to a third party).
+
+**A photo's place and country are stored on it and recomputed, like its time.** They're derived from the raw `lat`/`lon` and the place data, so they're recomputed whenever either changes, and never edited directly. Stored values make timeline and trip pages cheap, and M11's location fuzzing and M14's places build on them. Rejected: looking places up in every query (always current, but the same nearest-neighbour searches on every page load).
+
+**Place data is loaded by a script using Postgres `COPY`.** `python -m app.geodata load` downloads the files, parses them, and streams the rows into Postgres with `COPY`, which sends rows as one continuous stream instead of one `INSERT` statement per row. Tables are created by an Alembic migration; their contents are loaded by the script, because a migration should describe the schema, not download 30 MB. Rejected: loading inside a migration (every `alembic upgrade` would fetch data) and GDAL's `ogr2ogr` (the standard tool for geodata, but a system dependency every environment would need).
+
+**A photo is named after the place it's deepest inside, scaled by population.** The nearest named place is often wrong as a label: the nearest place to the Torre de Belém is Restelo, a neighbourhood of 7,000, and to the Eiffel Tower "Paris 16 Passy". So each place claims a radius of 20 m × √population (Lisbon 14 km, a neighbourhood of 12,000 2.3 km, a village of 1,000 630 m), and the photo is named after the place whose radius it's deepest inside: the smallest distance ÷ radius. If no radius reaches the photo, it gets the nearest place. The nearest place is stored too, as detail ("Baixa, Lisbon"). Four rules were compared on real spots before choosing:
+
+| Spot | Nearest | Nearest, skipping neighbourhoods | Biggest place in reach | **Deepest inside (chosen)** |
+|---|---|---|---|---|
+| Torre de Belém | Restelo | Algés | Lisbon | **Lisbon** |
+| Praça do Comércio | Baixa | Baixa | Lisbon | **Lisbon** |
+| Puerta del Sol | Sol | Madrid | Madrid | **Madrid** |
+| Pena Palace, Sintra | Sintra | Sintra | Algueirão (a suburb) | **Sintra** |
+| Eiffel Tower | Paris 16 Passy | Paris 16 Passy | Paris | **Paris** |
+| Remote beach | Ulgueira | Ulgueira | Ulgueira | **Ulgueira** |
+
+"Biggest place in reach" was the first fix and failed on the Pena Palace: a large suburb's radius reached it and outvoted the town it actually belongs to. Dividing by the radius lets a small town win right next to it. Versailles and the Brooklyn Bridge ("New York City", not "Financial District") also come out right. Some spots stay judgment calls (the Torre de Belém scores 0.48 for Lisbon against 0.53 for Restelo), and the 20 m factor is a tuning knob. It costs about 3 ms per photo, against 0.3 ms for nearest only, because every candidate within 50 km is measured.
+
+**A photo's country is the Natural Earth shape containing it, or the nearest within 12 nautical miles.** At this scale coastlines are approximate: a point on the Cascais shoreline is 733 m outside Portugal's shape. Within 22.2 km of a coast (a country's territorial waters), a photo takes the nearest country; further out at sea, none.
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -208,6 +229,25 @@ On one machine, pass B isn't faster one at a time: moving 3MB over loopback take
 
 The one duplicate in the first run was real: two generated screenshots were byte-identical. Re-importing a card costs seconds instead of a minute, since nothing is uploaded. Upload plus processing was slower than M5's rate would predict (~36s): each photo now also regroups trips over a growing set, hashes its bytes, and the machine's disk was ~99% full during the run, which slows storage writes. Which of these dominates isn't isolated yet; M8 removes the per-photo regroup, so re-measure then.
 
+**M7: loading the world's places** (GeoNames `cities1000`, 171,094 rows; Natural Earth countries, 258 shapes):
+
+| Insert method (same 20,000 rows) | Time | Rows per second |
+|---|---|---|
+| One `INSERT` per row | 8.32s | 2,403 |
+| `executemany` (the driver batches the statements) | 0.64s | 31,370 |
+| `COPY` | 0.03s | 592,770 |
+
+`COPY` is ~250× faster than a statement per row: per-row inserts pay a network round trip and a statement parse every time, while `COPY` streams every row through one command. The full 171,094 places load in 1.4s. The country shapes take another second, mostly repairing their geometry.
+
+**Nearest place: the index makes it ~800× faster.** Finding the nearest of 171,094 places to a point:
+
+| Query | Time (warm) | How Postgres runs it |
+|---|---|---|
+| `ORDER BY location <-> point LIMIT 1` | 0.3 ms | Walks the GiST spatial index outwards from the point and stops at the first match |
+| `ORDER BY ST_Distance(location, point) LIMIT 1` | 245 ms | Computes the distance to every row, then sorts (a parallel full scan) |
+
+Both give the same answer. `<->` is PostGIS's distance operator, and unlike `ST_Distance` it's one an index can order by: `EXPLAIN` shows `Index Scan using places_location_idx` for one and `Parallel Seq Scan on places` for the other. The place data takes 41 MB with its index, and the country shapes 8 MB.
+
 ## Known gaps
 
 - A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
@@ -227,7 +267,10 @@ The one duplicate in the first run was real: two generated screenshots were byte
 - Neighbour matching doesn't know about trips. A no-GPS photo can borrow a zone from a photo on a different trip if one is within 48 hours. Scoping it would create a circular dependency (trips need times, which need zones, which would need trips), so it's left as is.
 - Trips can't be unlocked, so a locked trip never benefits from later algorithm improvements. An "unlock" action would fix this.
 - Homes are entered as coordinates by hand. Auto-detecting home from where most photos are taken is M11.
-- Trip names default to dates until M7 adds places ("5 days in Portugal").
+- Photos without GPS have no place, even when a phone photo minutes later does. Times already borrow a zone from a nearby located photo; places could borrow the same way, but a guess would need marking as one, like a guessed zone.
+- Place names come from GeoNames' primary name, usually the local one ("Lisboa" would be ideal for some, "Lisbon" for others). Its alternate names include translations, but they aren't loaded.
+- The place data is a snapshot: `python -m app.geodata load` refreshes it and re-matches every photo, but nothing schedules that.
+- A photo far out at sea gets its nearest place however distant (stored with its distance), and no country.
 - The grouping thresholds (48h, 300 km / 24h, 3 photos, 25 km) are constants, not settings.
 - The timeline page only merges a trip with the next one. The API merges any set of trips.
 - Trip bounding boxes don't handle the antimeridian: a trip across the Pacific date line (e.g. Fiji) gets a box spanning the whole globe.

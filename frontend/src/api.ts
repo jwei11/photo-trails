@@ -18,6 +18,14 @@ export type Photo = {
   web_key: string | null
   processing_error: string | null
   trip_id: string | null
+  // From M7 (null without GPS): the place a person would name ("Lisbon"), the closest named
+  // place, often a neighbourhood ("Baixa"), and the country containing the photo.
+  place_name: string | null
+  nearest_place_name: string | null
+  region_name: string | null
+  country_name: string | null
+  country_code: string | null
+  place_distance_m: number | null
 }
 
 export type Day = { date: string; photos: Photo[] }
@@ -32,6 +40,10 @@ export type Trip = {
   photo_count: number
   distance_km: number
   bbox: [number, number, number, number] | null // min_lat, min_lon, max_lat, max_lon
+  // In the order first visited. A country's days are the local days with a photo in it,
+  // so a travel day counts for both countries.
+  countries: { code: string; name: string | null; days: number }[]
+  places: { name: string; country_code: string | null; photos: number }[]
 }
 
 export type TimelineTrip = Trip & { days: Day[]; undated: Photo[] }

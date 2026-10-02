@@ -29,6 +29,16 @@ export default function PhotoCard({ photo, actions }: { photo: Photo; actions?: 
             <strong>{photo.local_time.slice(11, 16)}</strong> <span className={styles.muted}>{zone}</span>
           </div>
         )}
+        {(photo.place_name || photo.country_name) && (
+          <div title={photo.region_name ?? undefined}>
+            {/* The neighbourhood first, when it's more precise than the place: "Baixa, Lisbon". */}
+            {[
+              photo.nearest_place_name !== photo.place_name ? photo.nearest_place_name : null,
+              photo.place_name,
+              photo.country_name,
+            ].filter(Boolean).join(', ')}
+          </div>
+        )}
         <div className={styles.muted}>{photo.original_filename ?? '(no name)'}</div>
         {guess && <span className={`${styles.badge} ${styles.guess}`}>{guess}</span>}
         {photo.shot_at && photo.lat == null && <span className={`${styles.badge} ${styles.info}`}>no GPS</span>}

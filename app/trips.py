@@ -197,3 +197,43 @@ def trip_stats(photos: Iterable[TripPhoto]) -> TripStats:
         distance_km=round(distance, 1),
         bbox=bbox,
     )
+
+
+@dataclass(frozen=True)
+class PlacedPhoto:
+    """A photo as the place summary sees it: when (local day) and where (place, country)."""
+    shot_at: datetime | None
+    local_day: object | None  # a date: the calendar day where the photo was taken
+    place_id: int | None
+    place_name: str | None
+    country_code: str | None
+    country_name: str | None
+
+
+def place_summary(photos: Iterable[PlacedPhoto]) -> dict:
+    """Countries and places of a trip, in the order first visited.
+
+    A country's days are the local days with at least one photo in it, so a day spent
+    travelling from Lisbon to Madrid counts for both: the parts can add up to more than
+    the trip, but no country you were in is ever hidden.
+    """
+    # Dated photos in time order first, so "first visited" is real; undated ones after.
+    ordered = sorted(photos, key=lambda p: (p.shot_at is None, p.shot_at or datetime.min))
+    countries: dict[str, dict] = {}
+    places: dict[int, dict] = {}
+    for p in ordered:
+        if p.country_code:
+            c = countries.setdefault(
+                p.country_code, {"code": p.country_code, "name": p.country_name, "days": set()}
+            )
+            if p.local_day:
+                c["days"].add(p.local_day)
+        if p.place_id is not None:
+            place = places.setdefault(
+                p.place_id, {"name": p.place_name, "country_code": p.country_code, "photos": 0}
+            )
+            place["photos"] += 1
+    return {
+        "countries": [{**c, "days": len(c["days"])} for c in countries.values()],
+        "places": list(places.values()),
+    }

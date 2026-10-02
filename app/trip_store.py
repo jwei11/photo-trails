@@ -32,8 +32,11 @@ def _trips_with_stats(conn: Connection, only: str | None = None) -> list[dict]:
         text(
             """
             SELECT t.id, t.name, t.is_locked, p.id AS photo_id, p.shot_at, p.lat, p.lon,
-                   p.local_offset_min
+                   p.local_offset_min, p.place_id, pl.name AS place_name, p.country_code,
+                   (SELECT name FROM countries WHERE iso_a2 = p.country_code LIMIT 1)
+                       AS country_name
             FROM trips t JOIN photos p ON p.trip_id = t.id
+            LEFT JOIN places pl ON pl.geonameid = p.place_id
             WHERE CAST(:only AS uuid) IS NULL OR t.id = CAST(:only AS uuid)
             """
         ),
@@ -52,11 +55,16 @@ def _trips_with_stats(conn: Connection, only: str | None = None) -> list[dict]:
         stats = trips.trip_stats(
             trips.TripPhoto(str(p.photo_id), p.shot_at, p.lat, p.lon) for p in ps
         )
-        local_days = {
-            (p.shot_at + timedelta(minutes=p.local_offset_min)).date()
+        def local_day(p):
+            return (p.shot_at + timedelta(minutes=p.local_offset_min)).date() if p.shot_at else None
+
+        local_days = {local_day(p) for p in ps if p.shot_at is not None}
+        places = trips.place_summary(
+            trips.PlacedPhoto(
+                p.shot_at, local_day(p), p.place_id, p.place_name, p.country_code, p.country_name
+            )
             for p in ps
-            if p.shot_at is not None
-        }
+        )
         result.append({
             **trip,
             "start": stats.start,
@@ -65,6 +73,7 @@ def _trips_with_stats(conn: Connection, only: str | None = None) -> list[dict]:
             "photo_count": stats.photo_count,
             "distance_km": stats.distance_km,
             "bbox": stats.bbox,
+            **places,
         })
     result.sort(key=lambda t: (t["start"] is None, t["start"] or datetime.min))
     return result
