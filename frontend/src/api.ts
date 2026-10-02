@@ -8,6 +8,7 @@ export type Photo = {
   camera_model: string | null
   lat: number | null
   lon: number | null
+  altitude_m: number | null // GPS altitude in metres, if the camera recorded it
   shot_at: string | null
   // Wall-clock time where the photo was taken; only set on dated photos in the timeline.
   local_time?: string

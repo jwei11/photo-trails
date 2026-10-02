@@ -1,4 +1,5 @@
 import { Link, NavLink, Route, Routes } from 'react-router'
+import TripMapPage from './map/TripMapPage.tsx'
 import styles from './App.module.css'
 import ImportPage from './imports/ImportPage.tsx'
 import { useImport } from './imports/useImport.ts'
@@ -20,6 +21,7 @@ export default function App() {
       <main>
         <Routes>
           <Route path="/" element={<TimelinePage />} />
+          <Route path="/trips/:tripId" element={<TripMapPage />} />
           <Route path="/import" element={<ImportPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<p>Page not found.</p>} />

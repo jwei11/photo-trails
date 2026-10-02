@@ -38,13 +38,13 @@ export function fakeApi(timeline: Timeline, reply?: (call: Call) => Reply) {
   return { ...api, timelineLoads: () => api.loads('/api/timeline') }
 }
 
-/** Renders a component with its own fresh cache, as the app would. */
-export function renderWithApp(ui: ReactNode) {
+/** Renders a component with its own fresh cache, as the app would, at a given URL. */
+export function renderWithApp(ui: ReactNode, at = '/') {
   // No retries: a failed request should fail the test at once, not after back-offs.
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>{ui}</MemoryRouter>
+      <MemoryRouter initialEntries={[at]}>{ui}</MemoryRouter>
     </QueryClientProvider>,
   )
 }
@@ -67,6 +67,7 @@ export function photo(id: string, overrides: Partial<Photo> = {}): Photo {
     web_key: `${id}_web.webp`,
     processing_error: null,
     trip_id: null,
+    altitude_m: null,
     place_name: 'Lisbon',
     nearest_place_name: 'Baixa',
     region_name: 'Lisbon',

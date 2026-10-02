@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import { Link } from 'react-router'
 import { tripEdits, type Photo, type TimelineTrip } from './api.ts'
 import DayList from './DayList.tsx'
 import { countryDays, plural, tripDates, tripLabel, tripTitle } from './format.ts'
@@ -73,6 +74,7 @@ export default function TripSection({ trip, next }: Props) {
           <div className={styles.muted}>{stats}</div>
         </div>
         <div className={styles.buttons}>
+          <Link className={styles.mapLink} to={`/trips/${trip.id}`}>Map</Link>
           {!renaming && <button disabled={busy} onClick={() => setRenaming(true)}>Rename</button>}
           {next && (
             <button disabled={busy} title={`Merge "${tripLabel(next)}" into this trip`}
