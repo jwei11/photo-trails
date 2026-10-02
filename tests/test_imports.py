@@ -3,7 +3,7 @@ from datetime import timedelta
 
 import httpx
 
-from app import cleanup, objects, storage
+from app import cleanup, jobs, objects, storage, worker
 from tests.test_api import jpeg
 
 LISBON = (38.72, -9.14)
@@ -36,10 +36,15 @@ def put(item, data: bytes, content_type="image/jpeg"):
     return httpx.put(item["upload_url"], content=data, headers={"Content-Type": content_type})
 
 
-def complete(client, imp, item):
+def complete(client, imp, item, process=True):
+    """Complete an item, then (by default) let the worker process the queue, as it would
+    in the background, and return the item's resulting state."""
     res = client.post(f"/api/imports/{imp['id']}/items/{item['id']}/complete")
     assert res.status_code == 200, res.text
-    return res.json()
+    if not process:
+        return res.json()
+    worker.drain()
+    return next(i for i in client.get(f"/api/imports/{imp['id']}").json()["items"] if i["id"] == item["id"])
 
 
 def upload_one(client, data: bytes, **kw):
@@ -99,7 +104,7 @@ def test_retry_after_the_photo_already_finished_marks_the_item_done(client):
     imp = start_import(client, describe(data))
     item = imp["items"][0]
     put(item, data)
-    storage.complete_upload(item["photo_id"])  # completion ran, but the item was never updated
+    storage.process_upload(item["photo_id"])  # processing ran, but the item was never updated
 
     res = client.post(f"/api/imports/{imp['id']}/items/{item['id']}/upload-url")
     assert res.status_code == 200
@@ -159,7 +164,7 @@ def test_one_failure_does_not_affect_the_rest_and_counts_are_reported(client):
     client.post(f"/api/imports/{imp['id']}/items/{bad['id']}/failed", json={"error": "network dropped"})
 
     summary = client.get(f"/api/imports/{imp['id']}").json()
-    assert summary["counts"] == {"total": 3, "uploading": 1, "done": 1, "duplicate": 0, "failed": 1}
+    assert summary["counts"] == {"total": 3, "uploading": 1, "processing": 0, "done": 1, "duplicate": 0, "failed": 1}
     failed = summary["items"][1]
     assert failed["failed_stage"] == "upload" and failed["error"] == "network dropped"
     assert client.get("/api/imports").json()[0]["counts"]["failed"] == 1
@@ -191,15 +196,23 @@ def test_processing_failure_is_retried_on_the_server_without_reuploading(client,
     item = imp["items"][0]
     put(item, data)
 
-    real = storage.complete_upload
-    monkeypatch.setattr(storage, "complete_upload", lambda *a: (_ for _ in ()).throw(RuntimeError("db hiccup")))
+    real = storage.process_upload
+    attempts = []
+
+    def broken(*args, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(storage, "process_upload", broken)
+    monkeypatch.setattr(jobs, "RETRY_BASE", timedelta(0))  # retry at once instead of 10s, 20s
     failed = complete(client, imp, item)
+    assert len(attempts) == 3  # retried, then gave up
     assert failed["status"] == "failed" and failed["failed_stage"] == "processing"
     assert "db hiccup" in failed["error"]
     renew = client.post(f"/api/imports/{imp['id']}/items/{item['id']}/upload-url")
     assert renew.status_code == 409  # already uploaded: retry processing instead
 
-    monkeypatch.setattr(storage, "complete_upload", real)
+    monkeypatch.setattr(storage, "process_upload", real)
     assert complete(client, imp, item)["status"] == "done"
 
 

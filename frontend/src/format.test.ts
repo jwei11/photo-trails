@@ -45,5 +45,8 @@ describe('days per country', () => {
       .toBe('5 days in Portugal, 2 in Spain')
     expect(countryDays({ countries: [country('PT', 'Portugal', 1)] })).toBe('1 day in Portugal')
     expect(countryDays({ countries: [] })).toBe('')
+    // Only undated photos in Spain: it was visited, but on no countable day.
+    expect(countryDays({ countries: [country('PT', 'Portugal', 3), country('ES', 'Spain', 0)] }))
+      .toBe('3 days in Portugal, in Spain')
   })
 })

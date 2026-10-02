@@ -31,6 +31,7 @@ function fakeServer({ stored = [] as string[], overrides = {} as Partial<EngineD
       Object.assign(item(id), { status: 'failed' as const, failed_stage: 'upload' as const, error })),
     put: vi.fn(async (_url: string, _file: File, _type: string, onProgress: (f: number) => void) => onProgress(1)),
     sha256: vi.fn(async (f: File) => f.name),
+    wait: vi.fn(async () => {}),
     onChanged: vi.fn(),
     ...overrides,
   }
@@ -189,5 +190,56 @@ describe('ImportEngine retries', () => {
     await engine.resume([file('a.jpg'), file('unrelated.jpg')])
     expect(statuses(engine)).toEqual({ 'a.jpg': 'done', 'b.jpg': 'failed' })
     expect(engine.getSnapshot().message).toBe("Resuming 1 file (1 didn't match).")
+  })
+})
+
+describe('following the worker', () => {
+  // A server whose worker needs `rounds` polls before every file shows as processed.
+  function slowWorker(rounds: number) {
+    let polls = 0
+    let imp: Import | null = null
+    const server = fakeServer()
+    const create = server.deps.create
+    const deps: EngineDeps = {
+      ...server.deps,
+      create: vi.fn(async (files: FileDescription[]) => (imp = await create(files))),
+      // Like the real server since M8: complete only queues the file.
+      complete: vi.fn(async (_imp: string, id: string) => ({ ...imp!.items.find((i) => i.id === id)!, status: 'processing' as const })),
+      get: vi.fn(async () => {
+        polls++
+        const status = polls > rounds ? ('done' as const) : ('processing' as const)
+        return { ...imp!, items: imp!.items.map((i) => ({ ...i, status })) }
+      }),
+    }
+    return { deps, engine: new ImportEngine(deps), polls: () => polls }
+  }
+
+  it('polls after uploading until the worker has processed every file', async () => {
+    const { deps, engine, polls } = slowWorker(2)
+    const seen: boolean[] = []
+    engine.subscribe(() => seen.push(engine.getSnapshot().processing))
+
+    await engine.start([file('a.jpg'), file('b.jpg')])
+    await vi.waitFor(() => expect(engine.getSnapshot().processing).toBe(false))
+
+    expect(polls()).toBe(3) // processing, processing, done
+    expect(seen).toContain(true)
+    expect(statuses(engine)).toEqual({ 'a.jpg': 'done', 'b.jpg': 'done' })
+    expect(deps.wait).toHaveBeenCalledTimes(2)
+    expect(deps.onChanged).toHaveBeenCalled()
+  })
+
+  it("doesn't block a new import while the worker is still busy with the last one", async () => {
+    const { deps, engine } = slowWorker(Infinity) // a worker that never finishes (or isn't running)
+    let release!: () => void
+    vi.mocked(deps.wait).mockImplementation(() => new Promise<void>((r) => { release = r }))
+
+    await engine.start([file('a.jpg')])
+    await vi.waitFor(() => expect(engine.getSnapshot().processing).toBe(true))
+    expect(engine.busy).toBe(false)
+
+    await engine.start([file('c.jpg')])  // allowed: the old import carries on on the server
+    release()
+    await vi.waitFor(() => expect(engine.getSnapshot().items.map((i) => i.filename)).toEqual(['c.jpg']))
   })
 })

@@ -12,7 +12,10 @@ docker compose up -d --wait db objects  # Postgres + PostGIS, and local S3-compa
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/alembic upgrade head  # apply migrations
 .venv/bin/uvicorn app.main:app --reload
+.venv/bin/python -m app.worker  # in another terminal: processes uploads in the background
 ```
+
+Without a worker running, imported files wait at "processing" (they're queued, not lost) until one starts. The worker also runs the orphan sweep every 15 minutes. Stop it with Ctrl-C: it finishes the jobs in progress first.
 
 The frontend is a React app in `frontend/` (needs Node 20.19+ or 22.12+). For development, run Vite's dev server alongside the API and open http://localhost:5173. It reloads on every save and forwards `/api` to the API on port 8000:
 
@@ -175,6 +178,14 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **A photo's country is the Natural Earth shape containing it, or the nearest within 12 nautical miles.** At this scale coastlines are approximate: a point on the Cascais shoreline is 733 m outside Portugal's shape. Within 22.2 km of a coast (a country's territorial waters), a photo takes the nearest country; further out at sea, none.
 
+**Background jobs are rows in a Postgres table, run by a worker we wrote.** Finishing an upload now only records that the file arrived and enqueues a job; a separate worker process does the slow part (download, decode, thumbnails, EXIF, time and place) and the browser polls for progress. The queue is a `jobs` table: a worker claims the next job with `SELECT ... FOR UPDATE SKIP LOCKED`, which locks the row it takes and skips rows other workers have locked, so several workers never take the same job and never wait on each other. Enqueueing happens in the same transaction as the change that needs the job, so a job can't be lost, and can't exist for a photo that was never saved; with a separate queue service those are two systems that can disagree (the "dual write" problem). The worker loop (claim, run, retry with backoff, reclaim jobs from a crashed worker) is hand-written, about 150 lines, so every part of it can be explained. Rejected: AWS SQS (managed and good AWS experience, but needs a transactional outbox to avoid the dual write, and an emulator or real AWS for local development and tests), Redis with RQ or Celery (a service to run, with the same dual-write problem), and the Procrastinate library (a Postgres task queue that does all this, but hides the parts this milestone is meant to teach).
+
+**A crashed worker's job is taken over when its lease runs out, so every job must be safe to run twice.** Claiming a job sets a lease: `locked_until`, five minutes ahead, far longer than any job takes. If the worker dies, the job stays `running` until the lease expires, then any worker can claim it again; nothing is stuck, but a job can now run twice. So each one is idempotent: processing a photo that's already `ready` returns it unchanged, derivative keys depend only on the photo's id (a rerun overwrites, never duplicates), and an import item is only updated while it's still `processing`. A worker's result only counts if it still holds the job, so a slow worker whose job was taken over can't overwrite the new worker's outcome. Review found two gaps here, both fixed and tested: a duplicate whose job crashed after discarding the copy was rerun as "upload expired" (it's now recognised by its hash), and a worker that had lost its job could still mark the photo failed. Failures that aren't crashes (storage or database unreachable) are retried after 10s, then 20s, then the photo is marked failed with the error and shown with a Retry button. A file that can't be decoded isn't a job failure: as before, it's stored and flagged.
+
+**Jobs are generic; photos keep their own status.** The `jobs` table holds any kind of work (processing a photo, regrouping trips, the orphan sweep) with its attempts, earliest run time, and lease. Photos keep the state the app shows: `pending → uploaded → processing → ready | failed`. Rejected: using the photo status as the queue (one less table, but regrouping and the sweep aren't about one photo).
+
+**Trips are regrouped by one coalesced job.** Every finished photo asks for a regroup, but at most one regroup job waits at a time (a unique index allows only one queued `regroup_trips` row), so an import of 200 photos regroups a handful of times, not 200, and trips settle shortly after the last photo. It needs no notion of an import being "finished", so a file that never uploads can't hold it up. Rejected: regrouping once at the end of each import (exactly once, but an import whose last file never arrives would never regroup without a timeout).
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -248,17 +259,39 @@ The one duplicate in the first run was real: two generated screenshots were byte
 
 Both give the same answer. `<->` is PostGIS's distance operator, and unlike `ST_Distance` it's one an index can order by: `EXPLAIN` shows `Index Scan using places_location_idx` for one and `Parallel Seq Scan on places` for the other. The place data takes 41 MB with its index, and the country shapes 8 MB.
 
+**M8 before: processing inside the request** (`python scripts/bench_import.py`: 200 synthetic files, 570 MB, 190 twelve-megapixel JPEGs and 10 screenshots; local SeaweedFS and the test database, same machine; same flow as the browser: hash, register the batch, upload 4 at a time, `complete` each):
+
+| Phase | Time |
+|---|---|
+| Hash 200 files | 0.7s |
+| Register the batch | 0.4s |
+| Upload + `complete`, 4 at a time | 47.4s |
+| **Total, until every photo is processed** | **48.5s** |
+| One upload (PUT), median | 87 ms |
+| One `complete`, median / 95th percentile | 812 ms / 1,167 ms |
+
+The upload is 10% of each photo's time; the browser spends the rest waiting on `complete`, which downloads the original, decodes it, writes thumbnails, reads EXIF, resolves time and place, and regroups every trip. `complete` is slower than in M6 (median ~570 ms): each call now also matches places, and regroups an ever larger set of trips.
+
+**M8 after: a worker processes in the background** (same script with `--wait`, same 200 files, one `python -m app.worker` with 4 threads beside the API):
+
+| | Before | After | |
+|---|---|---|---|
+| One `complete`, median / 95th percentile | 812 / 1,167 ms | **52 / 209 ms** | ~15× faster |
+| Browser's part (uploads and completes) | 47.4s | **10.5s** | 4.5× faster |
+| Until every photo is processed | 48.5s | **33.3s** | 31% faster |
+| Trip regroups | 200 | **6** | coalesced |
+
+`complete` now checks the file is in storage, marks it uploaded, and queues a job; the worker does the rest. The browser is done in 10.5s and can be closed; the server finishes on its own. Processing itself also got faster: regrouping every trip after each of 200 photos (each time over more photos) became 6 regroups, since a regroup request is absorbed by one already waiting. All 200 jobs succeeded first time, with no retries.
+
 ## Known gaps
 
 - A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
-- Orphan cleanup (`python -m app.cleanup`) is run by hand. M8's worker will run it on a schedule.
-- `complete` downloads the whole original into API memory to process it. M8 moves this to the worker.
+- The worker downloads each original into memory to process it (as `complete` did before M8). Fine for photos up to the 200 MB limit, but four threads processing large files at once need several hundred MB.
 - Anyone can request upload URLs: there are no accounts until M11. The 200 MB per-file cap limits the damage, not the count.
 - `POST /api/photos` rejects files over 200 MB before reading them into memory, but the web framework has already saved the whole request to a temporary file on disk by then, so a huge upload still costs disk space. Presigned uploads don't have this problem, since the file never reaches the API.
 - Uploads are limited to `image/*` (except SVG, which can contain script) and `application/octet-stream`, because the stored type is served back to browsers. Photos uploaded before this rule keep whatever type they were given.
 - The browser reads each file fully into memory to hash it (Web Crypto has no streaming hash). Fine for photos, but a 200 MB file briefly costs 200 MB of browser memory. Hashing also needs a secure context (HTTPS or localhost).
-- Trips are still regrouped after every photo in an import, not once at the end. M8 changes that.
 - Import items that are never uploaded stay `uploading` forever (their pending photo is swept after an hour). The import history shows them as "not uploaded", and they can be resumed by picking the files again.
 - SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them unless the bucket's CORS rule allows the origin. The app sets an explicit rule on SeaweedFS too, but the permissive default means offline development and tests can't catch a mistake in it. The S3 bucket's rule is set by hand in the console until M12 moves it to Terraform, so it can drift from `APP_ORIGINS`.
 - RAW files and video aren't decoded: they're stored, with no metadata or previews.

@@ -9,7 +9,7 @@ import psycopg
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from app import images, objects, timeresolve, trips, tz
+from app import images, jobs, objects, timeresolve, trips, tz
 from app.config import DEFAULT_TIMEZONE
 from app.db import engine
 
@@ -209,57 +209,92 @@ def _duplicate_of(conn: Connection, sha256: str, photo_id: str) -> str | None:
     return str(found) if found else None
 
 
-def _discard_pending(photo_id: str, storage_key: str) -> None:
+def _discard_upload(photo_id: str, storage_key: str) -> None:
+    """Drop an upload that turned out to duplicate a stored photo: its row and its file."""
     with engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM photos WHERE id = :id AND status = 'pending'"), {"id": photo_id}
-        )
+        conn.execute(text("DELETE FROM photos WHERE id = :id AND status <> 'ready'"), {"id": photo_id})
     objects.delete(storage_key)
 
 
 def add_photo(original_filename: str | None, content_type: str, contents: bytes) -> dict:
-    """Upload through the API (M5 pass A): the same steps a presigned upload goes through."""
+    """Upload through the API (M5 pass A), for scripts and tests. Unlike an import, it's
+    processed before returning, trips included, rather than by the worker."""
     pending = create_pending(original_filename, content_type, len(contents))
     objects.put(pending["storage_key"], contents, content_type)
-    return complete_upload(pending["id"], contents)
+    return process_upload(pending["id"], contents, regroup_now=True)
 
 
-def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
-    """Process an uploaded original and mark it ready. Safe to call more than once.
+def mark_uploaded(conn: Connection, photo_id: str, job_payload: dict) -> str:
+    """The client says the file is in storage: check, and queue it for processing, in the
+    caller's transaction. Returns the photo's status afterwards. Safe to call again."""
+    row = conn.execute(
+        text("SELECT storage_key, size_bytes, status FROM photos WHERE id = :id FOR UPDATE"),
+        {"id": photo_id},
+    ).first()
+    if row is None:
+        raise UploadNotFound  # swept as abandoned
+    if row.status in ("uploaded", "processing", "ready"):
+        return row.status  # already queued or done: nothing more to do
+    # A HEAD request: cheap, and catches a client that says "done" before its PUT finished.
+    if objects.size(row.storage_key) != row.size_bytes:
+        raise UploadNotReceived
+    conn.execute(text("UPDATE photos SET status = 'uploaded' WHERE id = :id"), {"id": photo_id})
+    # Same transaction as the status change: the job exists exactly when the photo is
+    # 'uploaded'. The dedupe key means a retried completion can't queue it twice.
+    jobs.enqueue(conn, "process_photo", {"photo_id": photo_id, **job_payload}, dedupe_key=photo_id)
+    return "uploaded"
+
+
+def mark_failed(photo_id: str, error: str) -> None:
+    """The worker gave up on this photo: record why, so it's shown, and can be retried."""
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE photos SET status = 'failed', processing_error = :error WHERE id = :id AND status <> 'ready'"),
+            {"id": photo_id, "error": error[:2000]},
+        )
+
+
+def process_upload(photo_id: str, contents: bytes | None = None, regroup_now: bool = False) -> dict:
+    """Process an uploaded original and mark it ready. Run by the worker, or directly by
+    add_photo. Idempotent: running it again for a ready photo returns it unchanged, and
+    derivative keys depend only on the id, so a rerun overwrites rather than duplicates.
 
     Raises DuplicatePhoto (after discarding this upload) if identical bytes are already stored.
     """
     started = time.perf_counter()
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         row = conn.execute(
-            text("SELECT storage_key, size_bytes, status FROM photos WHERE id = :id"),
+            text(
+                """
+                UPDATE photos SET status = 'processing'
+                WHERE id = :id AND status IN ('pending', 'uploaded', 'processing', 'failed')
+                RETURNING storage_key, size_bytes
+                """
+            ),
             {"id": photo_id},
         ).first()
-    if row is None:
-        raise UploadNotFound
-    if row.status == "ready":
-        return get_photo(photo_id)
+        if row is None:
+            if conn.execute(text("SELECT 1 FROM photos WHERE id = :id"), {"id": photo_id}).first():
+                return get_photo(photo_id)  # already ready: a rerun changes nothing
+            raise UploadNotFound
     if contents is None:
         if objects.size(row.storage_key) != row.size_bytes:
             raise UploadNotReceived
         contents = objects.get(row.storage_key)
-
     # The hash of the bytes actually stored, not the one the client declared.
     sha256 = hashlib.sha256(contents).hexdigest()
     with engine.connect() as conn:
         original = _duplicate_of(conn, sha256, photo_id)
     if original:
-        _discard_pending(photo_id, row.storage_key)
+        _discard_upload(photo_id, row.storage_key)
         raise DuplicatePhoto(original)
-
-    # Slow CPU work happens before taking the write lock, so uploads still process in parallel.
+    # Slow CPU work happens before taking the write lock, so photos still process in parallel.
     try:
         processed = images.process(contents)
         error = None
     except Exception as exc:  # any undecodable upload is stored, flagged, and skipped
         processed, error = None, f"{type(exc).__name__}: {exc}"
     process_ms = round((time.perf_counter() - started) * 1000)
-
     with engine.begin() as conn:
         lock_writes(conn)
         status = conn.execute(
@@ -268,15 +303,14 @@ def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
         if status is None:
             raise UploadNotFound  # swept as an orphan while we were processing
         if status == "ready":
-            return get_photo(photo_id)  # a concurrent completion finished first
+            return get_photo(photo_id)  # a concurrent run finished first
         # Re-check under the lock: an identical file may have completed while we processed.
         original = _duplicate_of(conn, sha256, photo_id)
         if original is None:
-            _store_processed(conn, photo_id, sha256, processed, error, process_ms)
+            _store_processed(conn, photo_id, sha256, processed, error, process_ms, regroup_now)
     if original:
-        _discard_pending(photo_id, row.storage_key)
+        _discard_upload(photo_id, row.storage_key)
         raise DuplicatePhoto(original)
-
     total_ms = round((time.perf_counter() - started) * 1000)
     log.info(
         "photo ready id=%s bytes=%d process_ms=%d total_ms=%d error=%s",
@@ -286,7 +320,8 @@ def complete_upload(photo_id: str, contents: bytes | None = None) -> dict:
 
 
 def _store_processed(
-    conn: Connection, photo_id: str, sha256: str, processed, error: str | None, process_ms: int
+    conn: Connection, photo_id: str, sha256: str, processed, error: str | None, process_ms: int,
+    regroup_now: bool,
 ) -> None:
     meta = processed.metadata if processed else None
     # Keys depend only on the id, so a retry overwrites rather than duplicates.
@@ -333,7 +368,14 @@ def _store_processed(
             "process_ms": process_ms,
         },
     )
-    recompute(conn)
+    # Place and time are cheap and per photo. Regrouping trips looks at every photo, so in
+    # an import it waits for one coalesced job instead of running after each photo.
+    resolve_places(conn)
+    resolve_times(conn)
+    if regroup_now:
+        regroup_trips(conn)
+    else:
+        jobs.enqueue(conn, "regroup_trips", dedupe_key="all")
 
 
 def resolve_times(conn: Connection) -> int:

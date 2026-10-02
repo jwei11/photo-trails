@@ -3,9 +3,11 @@ import { plural } from '../format.ts'
 
 // The browser hashes each file, registers the whole batch in one request (files the server
 // already has come back as duplicates), then uploads the rest straight to storage a few at
-// a time and asks the server to process each one.
+// a time and tells the server each one arrived. The server's worker processes them in the
+// background; the engine then follows the import, polling until every file is done.
 
 export const PARALLEL_UPLOADS = 4 // matches the parallelism measured in M3
+export const POLL_MS = 1000 // how often to check on files the worker is processing
 
 // Same rule as the server: images except SVG (it can contain script), or unknown bytes.
 const UPLOADABLE = /^(image\/(?!svg)[\w.+-]+|application\/octet-stream)$/
@@ -19,7 +21,11 @@ export type ImportState = {
   // The File behind each item, while it's in memory. After a page reload this is empty,
   // and unfinished items have to be picked again to resume.
   files: ReadonlyMap<string, File>
+  // hashing and uploading need this page; while they run, no other import can start.
   phase: 'idle' | 'hashing' | 'uploading'
+  // Following the worker's progress. Not "busy": the work is on the server, so another
+  // import can start (this one keeps going there) and the page can be closed.
+  processing: boolean
   hashed: number // files hashed so far, while phase is 'hashing'
   toHash: number
   skipped: string[] // names of files that aren't images
@@ -36,13 +42,14 @@ export type EngineDeps = {
   reportFailure: (importId: string, itemId: string, error: string) => Promise<ImportItem>
   put: (url: string, file: File, contentType: string, onProgress: (fraction: number) => void) => Promise<void>
   sha256: (file: File) => Promise<string>
+  wait: (ms: number) => Promise<void>
   // Called when files may have become photos, so cached server data can be refreshed.
   onChanged: () => void
 }
 
 const EMPTY: ImportState = {
   importId: null, items: [], progress: new Map(), files: new Map(), phase: 'idle',
-  hashed: 0, toHash: 0, skipped: [], repeats: 0, message: null,
+  processing: false, hashed: 0, toHash: 0, skipped: [], repeats: 0, message: null,
 }
 
 export function needsUpload(item: ImportItem) {
@@ -59,6 +66,8 @@ export class ImportEngine {
   private state: ImportState = EMPTY
   private listeners = new Set<() => void>()
   private deps: EngineDeps
+  // Each follow() loop takes the next number; a loop that sees a newer one stops.
+  private following = 0
 
   constructor(deps: EngineDeps) {
     this.deps = deps
@@ -97,6 +106,7 @@ export class ImportEngine {
       this.update({ ...EMPTY, message: skipped.length ? 'Only image files can be imported.' : null })
       return
     }
+    this.following++ // stop following any previous import; it carries on on the server
     this.update({ ...EMPTY, phase: 'hashing', toHash: files.length, skipped: skipped.map((f) => f.name) })
     try {
       // The same file picked twice (e.g. from two folders) is only sent once.
@@ -129,6 +139,7 @@ export class ImportEngine {
       this.update({ phase: 'idle' })
       this.deps.onChanged()
     }
+    this.followIfProcessing()
   }
 
   /** Show a past import, e.g. to retry its failures. Its files aren't in memory. */
@@ -144,7 +155,9 @@ export class ImportEngine {
     // An import started while this was loading takes priority: showing the old one now
     // would replace the running import's state.
     if (this.busy) return
+    this.following++
     this.update({ ...EMPTY, importId: imp.id, items: imp.items })
+    this.followIfProcessing()
   }
 
   /** Match re-picked files to unfinished items by content hash, then upload them. */
@@ -176,6 +189,7 @@ export class ImportEngine {
       this.update({ phase: 'idle' })
       this.deps.onChanged()
     }
+    this.followIfProcessing()
   }
 
   /**
@@ -201,6 +215,7 @@ export class ImportEngine {
       this.update({ phase: 'idle' })
       this.deps.onChanged()
     }
+    this.followIfProcessing()
     return true
   }
 
@@ -241,6 +256,36 @@ export class ImportEngine {
         // Couldn't even record it: show it locally. It still reads as "uploading" on the
         // server, so reopening the import later offers to resume it.
         this.setItem({ id: item.id, status: 'failed', failed_stage: 'upload', error: errorText(e) })
+      }
+    }
+  }
+
+  private followIfProcessing() {
+    const { importId, items, processing } = this.state
+    if (importId && !processing && items.some((i) => i.status === 'processing')) void this.follow(importId)
+  }
+
+  /** Poll the import until the worker has finished every file, updating items as it goes. */
+  private async follow(importId: string) {
+    const me = ++this.following
+    const current = () => me === this.following && this.state.importId === importId
+    this.update({ processing: true })
+    try {
+      while (current()) {
+        const imp = await this.deps.get(importId)
+        if (!current()) return
+        // The server is the truth for status; keep only what it doesn't know (upload URLs).
+        const fresh = new Map(imp.items.map((i) => [i.id, i]))
+        this.update({ items: this.state.items.map((i) => ({ ...i, ...fresh.get(i.id) })) })
+        if (!imp.items.some((i) => i.status === 'processing')) break
+        await this.deps.wait(POLL_MS)
+      }
+    } catch (e) {
+      if (current()) this.update({ message: `Couldn't check progress: ${errorText(e)}. Reopen the import to check again.` })
+    } finally {
+      if (me === this.following) {
+        this.update({ processing: false })
+        this.deps.onChanged() // processed photos are now on the timeline
       }
     }
   }

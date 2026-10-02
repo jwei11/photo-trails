@@ -10,6 +10,7 @@ export const importEngine = new ImportEngine({
   ...importsApi,
   put: putWithProgress,
   sha256: sha256Hex,
+  wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   // New photos change the timeline, the import history, and the camera list.
   onChanged: () => queryClient.invalidateQueries(),
 })

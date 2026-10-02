@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { tripEdits, type Photo, type TimelineTrip } from './api.ts'
 import DayList from './DayList.tsx'
-import { countryDays, plural, tripDates, tripTitle } from './format.ts'
+import { countryDays, plural, tripDates, tripLabel, tripTitle } from './format.ts'
 import PhotoGrid from './PhotoGrid.tsx'
 import styles from './TripSection.module.css'
 import { useEdit } from './useEdit.ts'
@@ -75,7 +75,7 @@ export default function TripSection({ trip, next }: Props) {
         <div className={styles.buttons}>
           {!renaming && <button disabled={busy} onClick={() => setRenaming(true)}>Rename</button>}
           {next && (
-            <button disabled={busy} title={`Merge "${tripTitle(next)}" into this trip`}
+            <button disabled={busy} title={`Merge "${tripLabel(next)}" into this trip`}
               onClick={() => edit.mutate(() => tripEdits.merge(trip.id, [next.id]))}>
               Merge with next
             </button>

@@ -1,8 +1,9 @@
 """Bulk imports: a batch of files, each tracked from upload URL to processed photo.
 
-Item status: uploading -> done | duplicate | failed. A failed item records the stage:
+Item status: uploading -> processing -> done | duplicate | failed. 'processing' means the
+file is in storage and queued for (or in) the worker. A failed item records the stage:
 'upload' means the file has to be sent again; 'processing' means it's in storage and
-completing again retries on the server.
+completing again queues it for another try.
 """
 import logging
 
@@ -91,6 +92,7 @@ def list_imports(limit: int = 20) -> list[dict]:
                 """
                 SELECT i.id, i.created_at, count(*) AS total,
                        count(*) FILTER (WHERE it.status = 'uploading') AS uploading,
+                       count(*) FILTER (WHERE it.status = 'processing') AS processing,
                        count(*) FILTER (WHERE it.status = 'done') AS done,
                        count(*) FILTER (WHERE it.status = 'duplicate') AS duplicate,
                        count(*) FILTER (WHERE it.status = 'failed') AS failed
@@ -104,7 +106,9 @@ def list_imports(limit: int = 20) -> list[dict]:
             {
                 "id": str(r.id),
                 "created_at": r.created_at,
-                "counts": {k: getattr(r, k) for k in ("total", "uploading", "done", "duplicate", "failed")},
+                "counts": {
+                    k: getattr(r, k) for k in ("total", "uploading", "processing", "done", "duplicate", "failed")
+                },
             }
             for r in rows
         ]
@@ -116,6 +120,8 @@ def renew_upload_url(import_id: str, item_id: str) -> dict:
         item = _get_item(conn, import_id, item_id, for_update=True)
         if item["status"] in ("done", "duplicate"):
             raise InvalidItemState("This file is already imported.")
+        if item["status"] == "processing":
+            return item  # already uploaded and queued (a lost response): no URL needed
         if item["failed_stage"] == "processing":
             raise InvalidItemState("This file is already uploaded; retry processing instead.")
         photo_status = item["photo_id"] and conn.execute(
@@ -124,6 +130,9 @@ def renew_upload_url(import_id: str, item_id: str) -> dict:
         if photo_status == "ready":
             # Completion finished but the item wasn't updated (e.g. a crash in between).
             _set_status(conn, item_id, "done", photo_id=item["photo_id"])
+            return _get_item(conn, import_id, item_id)
+        if photo_status in ("uploaded", "processing"):
+            _set_status(conn, item_id, "processing", photo_id=item["photo_id"])
             return _get_item(conn, import_id, item_id)
         if photo_status != "pending":  # swept as abandoned; start a new pending photo
             item["photo_id"] = storage.create_pending(
@@ -136,31 +145,46 @@ def renew_upload_url(import_id: str, item_id: str) -> dict:
 
 
 def complete_item(import_id: str, item_id: str) -> dict:
-    """Process an uploaded file. Safe to call again, including to retry a processing failure."""
-    with engine.connect() as conn:
-        item = _get_item(conn, import_id, item_id)
-    if item["status"] in ("done", "duplicate"):
-        return item
-
-    status, stage, error, photo_id = "done", None, None, item["photo_id"]
-    if photo_id is None:
-        status, stage, error = "failed", "upload", "The upload expired. Upload the file again."
-    else:
-        try:
-            photo_id = storage.complete_upload(photo_id)["id"]
-        except storage.DuplicatePhoto as dup:
-            status, photo_id = "duplicate", dup.original_id
-        except storage.UploadNotReceived:
-            status, stage, error = "failed", "upload", "Storage didn't receive the complete file."
-        except storage.UploadNotFound:
-            status, stage, error = "failed", "upload", "The upload expired. Upload the file again."
-        except Exception as exc:
-            log.exception("processing failed for import item %s", item_id)
-            status, stage, error = "failed", "processing", f"{type(exc).__name__}: {exc}"
-
+    """The file's upload finished: queue it for processing and return at once. Safe to call
+    again, including to retry a processing failure."""
     with engine.begin() as conn:
-        _set_status(conn, item_id, status, stage, error, photo_id)
+        item = _get_item(conn, import_id, item_id, for_update=True)
+        if item["status"] in ("done", "duplicate", "processing"):
+            return item
+        if item["photo_id"] is None:
+            _set_status(conn, item_id, "failed", "upload", "The upload expired. Upload the file again.")
+        else:
+            try:
+                # The worker reports back to this item when it's done (record_outcome).
+                storage.mark_uploaded(conn, item["photo_id"], {
+                    "import_id": import_id, "item_id": item_id, "sha256": item["declared_sha256"],
+                })
+                _set_status(conn, item_id, "processing", photo_id=item["photo_id"])
+            except storage.UploadNotReceived:
+                _set_status(conn, item_id, "failed", "upload", "Storage didn't receive the complete file.",
+                            item["photo_id"])
+            except storage.UploadNotFound:
+                _set_status(conn, item_id, "failed", "upload", "The upload expired. Upload the file again.")
     return get_item(import_id, item_id)
+
+
+def record_outcome(
+    item_id: str, status: str, stage: str | None = None, error: str | None = None,
+    photo_id: str | None = None,
+) -> None:
+    """The worker's result for an item. Only an item still waiting on the worker is updated,
+    so a late or repeated run can't overwrite a newer state (say, a fresh upload)."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE import_items SET status = :status, failed_stage = :stage, error = :error,
+                    photo_id = :photo_id, updated_at = now()
+                WHERE id = :id AND status = 'processing'
+                """
+            ),
+            {"id": item_id, "status": status, "stage": stage, "error": error, "photo_id": photo_id},
+        )
 
 
 def report_upload_failure(import_id: str, item_id: str, error: str) -> dict:
@@ -230,7 +254,7 @@ def _item_dict(row) -> dict:
 
 
 def _counts(items: list[dict]) -> dict:
-    counts = {"total": len(items), "uploading": 0, "done": 0, "duplicate": 0, "failed": 0}
+    counts = {"total": len(items), "uploading": 0, "processing": 0, "done": 0, "duplicate": 0, "failed": 0}
     for item in items:
         counts[item["status"]] += 1
     return counts

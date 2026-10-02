@@ -196,7 +196,7 @@ describe('trip edits', () => {
 
     const selects = await screen.findAllByRole('combobox', { name: 'Add to trip' })
     expect(selects).toHaveLength(2) // the photo at home and the undated one
-    await user.selectOptions(selects[0], 'Porto')
+    await user.selectOptions(selects[0], 'Porto (Jul 5, 2025)')
 
     await waitFor(() => expect(api.edits()).toEqual([{ method: 'PUT', path: '/api/photos/home/trip', body: { trip_id: 'porto' } }]))
   })
@@ -235,4 +235,19 @@ describe('trip edits', () => {
     await waitFor(() => expect(lisbon.getByRole('button', { name: 'Not a trip' })).toBeEnabled())
     expect(api.timelineLoads()).toBe(2)
   })
+})
+
+it('tells apart two trips with the same title in the Add to trip menu', async () => {
+  fakeApi({
+    ...timeline,
+    trips: [trip('lisbon24', lisbonPhotos), trip('lisbon25', portoPhotos)].map((t) => ({
+      ...t, places: [{ name: 'Lisbon', country_code: 'PT', photos: 3 }], countries: [],
+    })),
+  })
+  renderWithApp(<TimelinePage />)
+
+  const select = (await screen.findAllByRole('combobox', { name: 'Add to trip' }))[0]
+  const labels = within(select).getAllByRole('option').map((o) => o.textContent)
+  expect(new Set(labels).size).toBe(labels.length)
+  expect(labels.slice(1).every((l) => l?.startsWith('Lisbon ('))).toBe(true)
 })

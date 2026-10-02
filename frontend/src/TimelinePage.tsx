@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { api, tripEdits, type Photo, type Timeline, type TimelineTrip } from './api.ts'
 import DayList from './DayList.tsx'
-import { plural, tripTitle } from './format.ts'
+import { plural, tripLabel } from './format.ts'
 import PhotoGrid from './PhotoGrid.tsx'
 import styles from './TimelinePage.module.css'
 import TripSection from './TripSection.tsx'
@@ -70,7 +70,7 @@ function AddToTrip({ trips, disabled, onPick }: AddToTripProps) {
       onChange={(e) => onPick(e.target.value)}>
       <option value="">Add to trip…</option>
       {trips.map((t) => (
-        <option key={t.id} value={t.id}>{tripTitle(t)}</option>
+        <option key={t.id} value={t.id}>{tripLabel(t)}</option>
       ))}
     </select>
   )

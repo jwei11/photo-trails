@@ -57,9 +57,21 @@ export function tripTitle(trip: TimelineTrip) {
   return trip.name ?? placesTitle(trip) ?? tripDates(trip) ?? 'Untitled trip'
 }
 
-/** "5 days in Portugal, 2 in Spain". */
+/** "5 days in Portugal, 2 in Spain". A country with only undated photos has no days. */
 export function countryDays(trip: Pick<TimelineTrip, 'countries'>) {
   return trip.countries
-    .map((c, i) => `${i === 0 ? plural(c.days, 'day') : c.days} in ${c.name ?? c.code}`)
+    .map((c, i) => {
+      const name = c.name ?? c.code
+      if (!c.days) return `in ${name}`
+      return `${i === 0 ? plural(c.days, 'day') : c.days} in ${name}`
+    })
     .join(', ')
+}
+
+/** A trip's title with its dates, unless the title already is the dates: for lists where
+ * two trips can share a title ("Lisbon" in 2024 and in 2025). */
+export function tripLabel(trip: TimelineTrip) {
+  const title = tripTitle(trip)
+  const dates = tripDates(trip)
+  return dates && dates !== title ? `${title} (${dates})` : title
 }

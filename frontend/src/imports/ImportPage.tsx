@@ -49,6 +49,11 @@ export default function ImportPage() {
           onChange={(e) => onPick(e, (files) => importEngine.resume(files))} />
         <p className={styles.summary} aria-live="polite">{summary(state)}</p>
         {state.message && <p className={styles.muted}>{state.message}</p>}
+        {state.processing && state.phase === 'idle' && (
+          <p className={styles.muted}>
+            Uploads are done; the server is processing the rest. You can leave this page.
+          </p>
+        )}
         {needFiles.length > 0 && !busy && (
           <p>
             {plural(needFiles.length, 'file')} still {needFiles.length === 1 ? 'needs' : 'need'} uploading.{' '}
@@ -74,6 +79,7 @@ function summary(state: ImportState) {
   if (!items.length) return 'Pick photos to import. Files already imported are skipped without uploading.'
   const count = (status: ImportItem['status']) => items.filter((i) => i.status === status).length
   const parts = [`${count('done') + count('duplicate')} of ${items.length} done`]
+  if (count('processing')) parts.push(`${count('processing')} processing`)
   if (count('duplicate')) parts.push(`${count('duplicate')} already imported`)
   if (count('failed')) parts.push(`${count('failed')} failed`)
   if (state.skipped.length) parts.push(`${state.skipped.length} skipped (not images)`)

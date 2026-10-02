@@ -31,12 +31,13 @@ export default function App() {
 
 // Shown on every page while an import runs, since it keeps going when you navigate away.
 function ImportIndicator() {
-  const { phase, items, hashed, toHash } = useImport()
-  if (phase === 'idle') return null
-  const finished = items.filter((i) => i.status === 'done' || i.status === 'duplicate').length
+  const { phase, processing, items, hashed, toHash } = useImport()
+  if (phase === 'idle' && !processing) return null
+  const finished = items.filter((i) => ['done', 'duplicate', 'failed'].includes(i.status)).length
+  const label = phase === 'hashing' ? `Checking ${hashed}/${toHash}`
+    : phase === 'uploading' ? `Importing ${finished}/${items.length}`
+      : `Processing ${finished}/${items.length}`
   return (
-    <Link to="/import" className={styles.indicator} aria-live="polite">
-      {phase === 'hashing' ? `Checking ${hashed}/${toHash}` : `Importing ${finished}/${items.length}`}
-    </Link>
+    <Link to="/import" className={styles.indicator} aria-live="polite">{label}</Link>
   )
 }
