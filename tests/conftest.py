@@ -22,6 +22,9 @@ os.environ.update({
     "S3_REGION": "us-east-1",
     "S3_BUCKET": os.environ.get("TEST_S3_BUCKET", "photos-test"),
     "S3_MANAGE_BUCKET": "true",
+    # Google sign-in is off unless a test turns it on, whatever .env says.
+    "GOOGLE_CLIENT_ID": "",
+    "GOOGLE_CLIENT_SECRET": "",
 })
 if TEST_DATABASE_URL:
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL

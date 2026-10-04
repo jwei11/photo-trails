@@ -15,7 +15,6 @@ from sqlalchemy.exc import IntegrityError
 from app import auth
 from app.db import engine
 from app.main import api
-from tests.conftest import sign_in
 from tests.test_api import add_offset, jpeg, upload
 from tests.test_imports import describe, start_import
 from tests.test_trips_api import shoot

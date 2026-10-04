@@ -1,0 +1,3 @@
+# Python lint (CI runs `ruff check .`). Ruff's default rules: the ones that catch real
+# bugs (unused imports, undefined names, unused variables), not style.
+exclude = ["frontend", "data"]

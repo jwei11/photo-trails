@@ -1,0 +1,114 @@
+# Every pull request and every push to master: lint and test the backend and frontend,
+# and build the image and smoke-test the whole stack. On master, once all of that passes,
+# publish the image, tagged with the commit SHA.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# A newer push to the same branch or PR cancels the run still going for the older one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make a .env for CI
+        run: scripts/ci_env.sh > .env
+      # The same Postgres + PostGIS and SeaweedFS as development, from compose.yaml.
+      - name: Start the database and storage
+        run: docker compose up -d --wait db objects
+      - name: Create the test database
+        run: docker compose exec -T db sh -c 'createdb -U $POSTGRES_USER trips_test'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: python -m pytest -q
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck and build
+        run: npm run build
+      - name: Test
+        run: npm test
+
+  # M10's check, on every change: a fresh stack starts and works end to end.
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make a .env for CI
+        run: scripts/ci_env.sh > .env
+      - name: Build and start the whole stack
+        run: docker compose up -d --build --wait
+      - name: Smoke test
+        run: python3 scripts/smoke_compose.py
+      - name: Logs, if anything failed
+        if: failure()
+        run: docker compose logs --tail 100
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [backend, frontend, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Tagged with the commit, never `latest`: a deploy names exactly what it runs, and
+      # going back is deploying an older SHA. amd64 only: that's what the server runs.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The repo is private, so image storage is limited (500 MB): keep the newest few.
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ github.event.repository.name }}
+          package-type: container
+          min-versions-to-keep: 5

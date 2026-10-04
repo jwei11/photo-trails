@@ -10,7 +10,6 @@ Images are generated into a temporary folder and deleted at the end.
 """
 import argparse
 import hashlib
-import io
 import random
 import shutil
 import statistics
