@@ -1,0 +1,17 @@
+# The build context is everything Docker can COPY. Keep secrets, local data, and
+# machine-specific builds out of it, so none of them can end up in an image layer.
+.env
+.env.*
+!.env.example
+data/
+uploads/
+.venv
+**/__pycache__/
+*.pyc
+.git/
+.claude/
+frontend/node_modules/
+frontend/dist/
+docs/
+tests/
+scripts/

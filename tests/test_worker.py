@@ -1,5 +1,6 @@
 """The job queue's guarantees: claimed once, recovered after a crash, safe to run twice,
 coalesced where asked, retried then given up on."""
+import threading
 from datetime import timedelta
 
 from sqlalchemy import text
@@ -202,3 +203,25 @@ def test_a_worker_that_lost_its_job_does_not_mark_the_photo_failed(client, monke
 
     assert photo_status(item["photo_id"]) != "failed"
     assert job_rows("process_photo")[0].locked_by == "worker-b"
+
+
+def run_briefly(heartbeat):
+    stop = threading.Event()
+    threading.Timer(1.0, stop.set).start()
+    worker.run(1, stop, heartbeat=heartbeat)
+
+
+def test_the_worker_touches_its_heartbeat_file_while_it_can_reach_the_queue(client, tmp_path):
+    heartbeat = tmp_path / "heartbeat"
+    run_briefly(heartbeat)
+    assert heartbeat.exists()
+
+
+def test_the_heartbeat_stops_when_the_queue_is_unreachable(client, tmp_path, monkeypatch):
+    def unreachable(worker_id):
+        raise OSError("database is down")
+
+    monkeypatch.setattr(worker, "run_one", unreachable)
+    heartbeat = tmp_path / "heartbeat"
+    run_briefly(heartbeat)
+    assert not heartbeat.exists()

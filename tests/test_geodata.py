@@ -86,6 +86,20 @@ def test_loading_again_replaces_rather_than_duplicates(client, sample_files):
         assert conn.execute(text("SELECT count(*) FROM places")).scalar() == 4
 
 
+def test_if_empty_loads_into_an_empty_database(client, sample_files):
+    assert geodata.load(if_empty=True)["places"] == 4
+
+
+def test_if_empty_skips_without_downloading_when_places_are_already_loaded(client, sample_files):
+    geodata.load()
+    for path in sample_files.iterdir():
+        path.unlink()  # any attempt to fetch would now try the never-downloaded URLs
+
+    assert geodata.load(if_empty=True) == {"skipped": "place data is already loaded"}
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM places")).scalar() == 4
+
+
 def test_copy_is_used_by_the_benchmark_and_all_methods_insert_every_row(client, sample_files):
     result = geodata.benchmark(rows=4)
     assert result["rows"] == 4

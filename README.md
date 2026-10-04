@@ -6,14 +6,48 @@ Built milestone by milestone following [docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md
 
 ## Setup
 
+### Run it (Docker only)
+
+Needs Docker with Compose, and nothing else: no Python, Node, or AWS account.
+
 ```bash
-cp .env.example .env            # then set real passwords and your bucket (below)
+git clone <this repo> && cd photo-trails
+cp .env.example .env     # then replace every change-me (letters and digits only)
+docker compose up --build
+```
+
+Open http://localhost:8000. The first start builds the image (about a minute), applies the database migrations, and downloads and loads the place data in the background (about 23 MB; photos get place names once it's done). Photos are stored in the local SeaweedFS. To use an Amazon S3 bucket instead, see **Photo storage** below. Stop with Ctrl-C, or `docker compose down` if it was started with `-d`. The data stays in Docker volumes until `docker compose down -v`.
+
+```
+           browser: http://localhost:8000 (app + API)   http://localhost:8333 (signed photo URLs)
+ ─ host ──────────────────┼──────────────────────────────────────┼──────────────────────
+ compose network:         ▼                                      ▼
+                         api ───────────────────────────────▶ objects (SeaweedFS)
+                          │                                      ▲
+                          ▼                                      │
+   migrate (exits) ──▶   db (Postgres + PostGIS)  ◀──────────  worker
+   geodata (exits) ──▶
+```
+
+`api`, `worker`, `migrate`, and `geodata` all run the one image built from the `Dockerfile`, with different commands. `migrate` applies migrations and exits, and the API and worker start only once it has succeeded. `geodata` loads place data if none is loaded, and exits. The ports are published on 127.0.0.1 only; if one is taken, set `DB_PORT`, `OBJECTS_PORT`, or `API_PORT` in `.env`.
+
+To check a stack end to end (it uploads a test photo, so only on a fresh one): `docker compose up -d --build --wait && python3 scripts/smoke_compose.py`.
+
+### Develop
+
+For development, run the database and storage in Docker and the API, worker, and frontend directly on your machine, where they reload on every save:
+
+```bash
+cp .env.example .env            # then set real passwords
 docker compose up -d --wait db objects  # Postgres + PostGIS, and local S3-compatible storage
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/alembic upgrade head  # apply migrations
+.venv/bin/python -m app.geodata load    # place data, once (downloads to data/geo/)
 .venv/bin/uvicorn app.main:app --reload
 .venv/bin/python -m app.worker  # in another terminal: processes uploads in the background
 ```
+
+Don't run the whole stack (`docker compose up` with no service names) at the same time: its API also wants port 8000.
 
 Without a worker running, imported files wait at "processing" (they're queued, not lost) until one starts. The worker also runs the orphan sweep every 15 minutes. Stop it with Ctrl-C: it finishes the jobs in progress first.
 
@@ -25,13 +59,13 @@ cd frontend && npm install && npm run dev
 
 To serve it from the API instead, as in production, build it once with `npm run build` and open http://localhost:8000. The API docs are at http://localhost:8000/docs.
 
-**Photo storage** is an Amazon S3 bucket, set up once in the AWS console, before anything else: a billing budget (the Zero spend template plus a small monthly one), then a bucket in `S3_REGION` with Block all public access on, a CORS rule allowing `GET` and `PUT` with a `content-type` header from `http://localhost:5173` and `http://localhost:8000`, and an IAM user whose only permissions are `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on its objects. Put that user's access key in `.env`. The app checks it can reach the bucket at startup and says why if it can't. To work fully offline instead, point the `S3_*` settings at the local SeaweedFS (see `.env.example`). To copy photos from SeaweedFS into the bucket: `.venv/bin/python -m app.copy_storage --dry-run`, then without `--dry-run`. It's safe to re-run and never deletes anything.
+**Photo storage** is the local SeaweedFS by default. To use an Amazon S3 bucket, set one up once in the AWS console, before anything else: a billing budget (the Zero spend template plus a small monthly one), then a bucket in `S3_REGION` with Block all public access on, a CORS rule allowing `GET` and `PUT` with a `content-type` header from `http://localhost:5173` and `http://localhost:8000`, and an IAM user whose only permissions are `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on its objects. Put that user's access key in `.env`, with `S3_ENDPOINT` and `DOCKER_S3_ENDPOINT` both empty (see `.env.example`). The app checks it can reach the bucket at startup and says why if it can't. To copy photos from SeaweedFS into the bucket: `.venv/bin/python -m app.copy_storage --dry-run`, then without `--dry-run`. It's safe to re-run and never deletes anything.
 
 Run the tests: `.venv/bin/python -m pytest`. They always use the local SeaweedFS, never S3, and refuse to start if `TEST_S3_ENDPOINT` points anywhere else, because the API tests empty their bucket. The API tests need their own database, because they wipe it. Create it once with `docker compose exec db sh -c 'createdb -U $POSTGRES_USER trips_test'` and set `TEST_DATABASE_URL` in `.env`. Without it, those tests are skipped. Don't run a worker against the test database while testing (as `scripts/bench_import.py` setups do): the tests run queued jobs themselves, and a worker would take some of them, failing tests at random. A worker on the dev database is fine.
 
 Frontend tests: `cd frontend && npm test`. They render components in a simulated browser with a fake API, so they need neither the server nor the database.
 
-Reset all data from scratch (database and stored photos): `docker compose down -v && docker compose up -d --wait db objects && .venv/bin/alembic upgrade head`
+Reset all data from scratch (database, stored photos, and downloaded place data): `docker compose down -v && docker compose up -d --wait db objects && .venv/bin/alembic upgrade head`
 
 ## How a photo gets its time
 
@@ -192,6 +226,24 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Trips are regrouped by one coalesced job.** Every finished photo asks for a regroup, but at most one regroup job waits at a time (a unique index allows only one queued `regroup_trips` row), so an import of 200 photos regroups a handful of times, not 200, and trips settle shortly after the last photo. It needs no notion of an import being "finished", so a file that never uploads can't hold it up. Rejected: regrouping once at the end of each import (exactly once, but an import whose last file never arrives would never regroup without a timeout).
 
+**One image runs the API, the worker, migrations, and the place-data load (M10).** They're the same code started with different commands, so separate images would only add build time and a way for them to drift apart. The `Dockerfile` has three stages: Node builds the React app, Python installs the packages into a virtualenv, and the final stage copies in just the virtualenv, the code, and the built frontend. Node, npm's cache, and the compiler stay behind in the discarded stages. Test tools moved to `requirements-dev.txt`, so they don't ship. A `.dockerignore` keeps `.env`, `data/`, and local builds out of what Docker can copy: without it, `COPY` would bake the AWS keys into an image layer. In `compose.yaml` only the `api` service builds the image (`pull_policy: build`, so every `up` rebuilds it from the cache and never runs old code or pulls a same-named image from Docker Hub), and the other three use it with `pull_policy: never`: with `build:` on all four, compose built the same image four times, which filled the disk. Rejected: a separate nginx image for the frontend (see "FastAPI serves the built frontend").
+
+**The final image is `python:3.13-slim-bookworm`, pinned by digest, with no compiler (M10).** It's Debian, so Python packages install as prebuilt wheels for both arm64 (Apple Silicon) and amd64. One exception surfaced in the first build: `timezonefinder` publishes Linux wheels only for x86_64, so on arm64 its small C extension has to be compiled. The middle stage installs `gcc` to build it, and only the compiled result is copied on. pip runs with `--only-binary=:all: --no-binary=timezonefinder`, so a new dependency that needs compiling fails the build instead of quietly depending on the compiler being there. The pin is a digest rather than just the tag, so a rebuild months from now gets the same bytes (each digest covers both architectures). Rejected: Alpine (its musl C library has fewer prebuilt wheels, so numpy, pillow-heif, and h3 could need compiling, and it has subtle DNS and performance differences) and distroless (the smallest attack surface, but its Python version is Debian's, and with no shell it's harder to debug).
+
+**Containers run as an unprivileged user and say whether they're healthy (M10).** The image runs as user `app` (uid 10001). The code is owned by root and read-only to that user, so a compromised process can't rewrite the app. It's compiled to bytecode at build time, since the app can't write `__pycache__` later. The API's healthcheck requests `/healthz` with Python's own `urllib` (slim has no curl). The worker serves no HTTP, so it touches a heartbeat file each time it successfully checks the queue, and its healthcheck fails if the file is over a minute old. A hung worker or one cut off from the database turns unhealthy, while one that's merely idle doesn't. Commands use the exec form, so the process is PID 1 and gets `docker stop`'s SIGTERM itself, and the worker has 30 seconds to finish its jobs before it's killed.
+
+**Migrations run in a one-shot `migrate` service (M10).** It runs `alembic upgrade head` and exits. The API and worker wait for it with `depends_on: condition: service_completed_successfully`, so they never run against an old schema, a failed migration shows as its own failed container, and it runs once however many API containers start. M12's deploy can run it the same way, as a one-off task before the new version starts. Rejected: migrating in the API's startup (two replicas would race, since Alembic takes no lock, and the worker could start first).
+
+**A fresh clone stores photos in SeaweedFS; the containers follow whatever `.env` says (M10).** Someone trying the app shouldn't need an AWS account, so `.env.example` points at the local SeaweedFS. Inside the compose network, services reach each other by service name: in a container, `localhost` is that container itself. So the API reaches storage at `DOCKER_S3_ENDPOINT` (`http://objects:8333`), while browsers get URLs signed for `http://localhost:8333` (`S3_PUBLIC_ENDPOINT`, falling back to `S3_ENDPOINT`). That's the M5 two-endpoint split. With both endpoints empty, the containers use Amazon S3, as my own `.env` does. That matters because my worktrees share one compose project, so a full `docker compose up` uses the real dev database, whose photos are in S3. Compose builds `DATABASE_URL` itself, with the host `db`, from the `POSTGRES_*` values, and stops with a message (`${VAR:?}`) if `.env` leaves one out, rather than starting with an empty password. Published ports bind to 127.0.0.1, so the database and storage aren't reachable from other machines on the network. In `.env.example` each secret appears once and the other settings refer to it (`S3_ACCESS_KEY=${SEAWEEDFS_ACCESS_KEY}`, the password inside `DATABASE_URL`). Both compose and python-dotenv expand `${...}` in `.env`. The rehearsal caught this: with each `change-me` replaced separately, the app's storage keys would no longer match SeaweedFS's.
+
+**Place data loads by itself on first start, without holding anything up (M10).** A one-shot `geodata` service runs `python -m app.geodata load --if-empty` after migrations. It exits at once if place data is already loaded, and otherwise downloads (cached in a volume) and loads it. Nothing waits for it: the app works meanwhile, and photos get place names when the load finishes, since a load re-matches every photo. Rejected: a documented command only (simpler, but "clone and `docker compose up`" would show a map with no place names).
+
+**Development stays outside Docker; the full stack is for production-like runs (M10).** The API, worker, and Vite keep running on the Mac with only `db` and `objects` in Docker, because reloading on every save through bind mounts and Colima's VM is slow and unreliable, and `node_modules` built for macOS doesn't work in Linux. The API and worker containers have `restart: on-failure`: an early worker crashed on a failed lookup of `db` during startup, and this restarts after a crash like that. Rejected: `unless-stopped`, which also restarts containers whenever Docker starts, so after every wake of the Mac the full stack would come back and take port 8000 from the API run on the Mac. The containerized worker uses the dev database, never `trips_test`, so it can't take the tests' jobs.
+
+**"A fresh machine can clone and run it" is tested with a smoke script, not by eye (M10).** `scripts/smoke_compose.py` checks a running stack the way a browser uses it: the React app is served, the container runs as non-root with no compiler, an import's file goes to the presigned URL (proving the URL is signed for a host reachable from outside Docker), the worker container processes it, and the thumbnail redirect serves a WebP. It uses only Python's standard library, so it needs nothing on the host but Docker and Python, and it can become M12's CI job. It refuses to run against a stack that already has photos, since there's no delete. The rehearsal is a copy of exactly what a clone would contain, in a temporary folder, with its own compose project, a `.env` made from `.env.example`, and a build with no cache. It passed on 2026-10-03: the uncached build took 85 seconds, everything was healthy 11 seconds later, and a second start skipped the migrations and place data it had already done. Then the real test: someone else's laptop.
+
+**Still no Redis (M10).** The guide's compose file lists Redis, but background jobs are a Postgres table (see "Background jobs are rows in a Postgres table"), so nothing would use it.
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -291,6 +343,9 @@ The upload is 10% of each photo's time; the browser spends the rest waiting on `
 
 ## Known gaps
 
+- M10 isn't done until the stack has been started from a fresh clone on someone else's laptop. So far it has only run on my own Mac (arm64): the amd64 build, which is what an Intel laptop or a CI runner would make, hasn't been tried.
+- The image is 592 MB (154 MB compressed), mostly numpy, Pillow, pillow-heif, and boto3. Nothing has been done to trim it.
+- The first start needs internet access for the place data. Offline, `geodata` fails and photos have no place names until it's run again.
 - A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
 - The worker downloads each original into memory to process it (as `complete` did before M8). Fine for photos up to the 200 MB limit, but four threads processing large files at once need several hundred MB.

@@ -1,6 +1,7 @@
 """Load the place data: GeoNames places and regions, Natural Earth country borders.
 
 Run: python -m app.geodata load               downloads to data/geo/ the first time
+     python -m app.geodata load --if-empty    only if no place data is loaded (first start)
      python -m app.geodata benchmark [--rows N]  compares insert methods on a sample
 
 Loading replaces all place data in one transaction, so the app never sees it half-loaded,
@@ -100,7 +101,11 @@ def copy_rows(conn: Connection, table: str, columns: tuple, rows: Iterable[tuple
     return count
 
 
-def load() -> dict:
+def load(if_empty: bool = False) -> dict:
+    if if_empty:
+        with engine.connect() as conn:
+            if conn.execute(text("SELECT EXISTS (SELECT 1 FROM places)")).scalar():
+                return {"skipped": "place data is already loaded"}
     paths = {name: fetch(name) for name in SOURCES}
     timings = {}
     with engine.begin() as conn:
@@ -181,8 +186,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("load", help="download (first time) and load all place data")
+    load_cmd = sub.add_parser("load", help="download (first time) and load all place data")
+    load_cmd.add_argument("--if-empty", action="store_true", help="do nothing if place data is already loaded")
     bench = sub.add_parser("benchmark", help="time three insert methods on a sample")
     bench.add_argument("--rows", type=int, default=20_000)
     args = parser.parse_args()
-    print(load() if args.command == "load" else benchmark(args.rows))
+    print(load(args.if_empty) if args.command == "load" else benchmark(args.rows))

@@ -3,6 +3,9 @@
 Each thread loops: claim the next job, run its handler, record success, or record the
 failure (retried with backoff, until it gives up). Ctrl-C or SIGTERM finishes the jobs
 in progress, then exits; a hard kill leaves them to be reclaimed when their lease ends.
+
+With WORKER_HEARTBEAT_FILE set (as in Docker), each thread touches that file whenever it
+reaches the queue, so a healthcheck can tell a working worker from a hung or cut-off one.
 """
 import argparse
 import logging
@@ -13,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 
 from sqlalchemy import text
 
@@ -115,7 +119,7 @@ def drain(worker_id: str = "drain") -> int:
     return ran
 
 
-def run(threads: int, stop: threading.Event) -> None:
+def run(threads: int, stop: threading.Event, heartbeat: Path | None = None) -> None:
     with engine.begin() as conn:
         jobs.enqueue(conn, "sweep", dedupe_key="sweep")  # start the sweep cycle if it isn't
     worker_name = f"{socket.gethostname()}:{os.getpid()}"
@@ -128,6 +132,9 @@ def run(threads: int, stop: threading.Event) -> None:
             except Exception:  # e.g. the database is down: don't die, wait and try again
                 log.exception("worker %s couldn't reach the queue", worker_id)
                 ran = False
+            else:
+                if heartbeat:
+                    heartbeat.touch()
             if not ran:
                 stop.wait(IDLE_POLL_SECONDS)
 
@@ -150,4 +157,5 @@ if __name__ == "__main__":
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())  # finish current jobs, then exit
-    run(args.threads, stop)
+    heartbeat = os.environ.get("WORKER_HEARTBEAT_FILE")
+    run(args.threads, stop, Path(heartbeat) if heartbeat else None)
