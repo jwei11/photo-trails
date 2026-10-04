@@ -69,8 +69,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Make a .env for CI
         run: scripts/ci_env.sh > .env
+      # Not `up --wait`: it fails if a one-shot service (geodata, still downloading) is
+      # running without a healthcheck when the rest turn healthy. Waiting for geodata to
+      # exit also fails the job if the place data doesn't load.
       - name: Build and start the whole stack
-        run: docker compose up -d --build --wait
+        run: docker compose up -d --build
+      - name: Wait for the place data to load
+        run: docker compose wait geodata
       - name: Smoke test
         run: python3 scripts/smoke_compose.py
       - name: Logs, if anything failed

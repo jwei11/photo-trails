@@ -33,7 +33,7 @@ Open the printed link (it's valid for 15 minutes) and press the button to sign i
 
 `api`, `worker`, `migrate`, and `geodata` all run the one image built from the `Dockerfile`, with different commands. `migrate` applies migrations and exits, and the API and worker start only once it has succeeded. `geodata` loads place data if none is loaded, and exits. The ports are published on 127.0.0.1 only; if one is taken, set `DB_PORT`, `OBJECTS_PORT`, or `API_PORT` in `.env`.
 
-To check a stack end to end (it uploads a test photo, so only on a fresh one): `docker compose up -d --build --wait && python3 scripts/smoke_compose.py`.
+To check a stack end to end (it uploads a test photo, so only on a fresh one): `docker compose up -d --build && docker compose wait geodata && python3 scripts/smoke_compose.py`.
 
 ### Develop
 

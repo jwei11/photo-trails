@@ -1,7 +1,7 @@
 """Check that a stack started by `docker compose up` works end to end, the way a browser
 uses it. Run against a fresh stack, from the repo root:
 
-    docker compose up -d --build --wait
+    docker compose up -d --build && docker compose wait geodata
     python3 scripts/smoke_compose.py [--api http://localhost:8000]
 
 It creates a user and uploads one small photo, and leaves them there (there's no delete),
