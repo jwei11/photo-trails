@@ -117,12 +117,14 @@ def sharing(user_id: str, trip_id: str) -> dict:
             {"trip": trip_id, "user": user_id},
         ).all()
     now = datetime.now(timezone.utc)
+    ready = _shareable_from(photos)
     return {
         "shares": [_share_dict(s) for s in shares],
+        "can_share": ready is not None and ready <= now,
         "has_homes": bool(homes),
         "hidden_near_home": sum(_near_home(p, homes) for p in photos),
         "hidden_recent": sum(_recent(p, now) for p in photos),
-        "shareable_from": _shareable_from(photos),
+        "shareable_from": ready,
     }
 
 

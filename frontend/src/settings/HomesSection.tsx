@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
 import { settingsApi } from '../api.ts'
+import { dateRange } from '../format.ts'
 import { useEdit } from '../useEdit.ts'
 import { parseCoordinates } from './settingsFormat.ts'
 import styles from './Settings.module.css'
@@ -13,9 +14,10 @@ export default function HomesSection() {
     <section className={styles.panel}>
       <h2>Homes</h2>
       <p className={styles.muted}>
-        Photos near a home aren't counted as trips. Get coordinates from a map app (e.g.
-        right-click a spot in Google Maps).
+        Photos near a home aren't counted as trips, and are never shown in a shared trip. Get
+        coordinates from a map app (e.g. right-click a spot in Google Maps).
       </p>
+      <HomeSuggestions />
       {homes.error && <p className={styles.error}>Couldn't load homes: {homes.error.message}</p>}
       {homes.data?.length === 0 && (
         <p className={styles.muted}>No home set: photos taken at home may be grouped into trips.</p>
@@ -39,6 +41,38 @@ export default function HomesSection() {
       )}
       <AddHomeForm />
     </section>
+  )
+}
+
+// Places that look like home, from where photos pile up over weeks. Only suggestions:
+// nothing changes until one is added, since a wrong home would regroup trips.
+function HomeSuggestions() {
+  const suggestions = useQuery({ queryKey: ['homes', 'suggestions'], queryFn: settingsApi.homeSuggestions })
+  const add = useEdit()
+  if (!suggestions.data?.length) return null
+  return (
+    <div className={styles.suggestions}>
+      <p><strong>Looks like home?</strong> You've taken photos here on many different days.</p>
+      <ul className={styles.offsets}>
+        {suggestions.data.map((h) => (
+          <li key={`${h.lat},${h.lon}`}>
+            <span>
+              <strong>{h.place_name ? `Near ${h.place_name}` : `${h.lat.toFixed(3)}, ${h.lon.toFixed(3)}`}</strong>{' '}
+              <span className={styles.muted}>
+                photos on {h.day_count} days, {dateRange(h.first_day, h.last_day)}
+              </span>
+            </span>
+            <button className="small" disabled={add.isPending}
+              onClick={() => add.mutate(() => settingsApi.addHome({
+                name: h.place_name ?? 'Home', lat: h.lat, lon: h.lon, radius_km: 25,
+              }))}>
+              Add as home
+            </button>
+          </li>
+        ))}
+        {add.error && <li className={styles.error}>{add.error.message}</li>}
+      </ul>
+    </div>
   )
 }
 

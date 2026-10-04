@@ -108,6 +108,7 @@ def test_photos_near_a_home_are_left_out(client, places):
     client.post("/api/homes", json={"name": "Home", "lat": BELEM[0], "lon": BELEM[1], "radius_km": 1})
     sharing = client.get(f"/api/trips/{trip_id}/shares").json()
     assert sharing["has_homes"] and sharing["hidden_near_home"] == 2
+    assert sharing["can_share"] is True
 
     s = share(client, trip_id)
     view = public(client, s["token"]).json()
@@ -129,6 +130,7 @@ def test_a_trip_can_only_be_shared_a_week_after_it_ends(client, places):
     trip_id = client.get("/api/trips").json()[0]["id"]
     sharing = client.get(f"/api/trips/{trip_id}/shares").json()
     assert sharing["hidden_recent"] == 3
+    assert sharing["can_share"] is False
     assert datetime.fromisoformat(sharing["shareable_from"]) > datetime.now(timezone.utc)
     res = client.post(f"/api/trips/{trip_id}/shares", json={})
     assert res.status_code == 409 and "a week after they end" in res.json()["detail"]

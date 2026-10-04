@@ -1,4 +1,5 @@
-import type { Photo, TimelineTrip } from '../api.ts'
+import { photoUrl, type Photo, type TimelineTrip } from '../api.ts'
+import type { MapMarker } from './TripMap.tsx'
 
 // The trip map's data, worked out from the timeline without any map code, so it can be
 // tested on its own.
@@ -26,6 +27,23 @@ export function route(trip: TimelineTrip): Stop[] {
 /** Photos to show as markers: everything with a location, dated or not. */
 export function markers(trip: TimelineTrip): Located[] {
   return tripPhotos(trip).filter(located)
+}
+
+/** A photo as the owner's map shows it. */
+export function photoMarker(p: Located): MapMarker {
+  return {
+    id: p.id,
+    lat: p.lat,
+    lon: p.lon,
+    thumb: p.thumb_key ? photoUrl.thumb(p.id) : null,
+    web: p.web_key ? photoUrl.web(p.id) : null,
+    title: p.original_filename ?? '',
+    lines: [
+      p.local_time ? `${p.local_time.slice(0, 10)} ${p.local_time.slice(11, 16)}` : 'No date',
+      [p.place_name, p.country_name].filter(Boolean).join(', '),
+      p.original_filename ?? '',
+    ],
+  }
 }
 
 /** Kilometres along the route up to and including stop `upTo`, straight lines between stops. */

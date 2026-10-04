@@ -1,0 +1,78 @@
+.panel {
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.panel h3 {
+  margin: 0 0 0.25rem;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.notes {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+}
+
+.warn {
+  color: var(--warn-text);
+}
+
+.error {
+  color: var(--danger);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.form fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.form legend {
+  margin-bottom: 0.25rem;
+  font-weight: 500;
+}
+
+.links {
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.links li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.links input {
+  flex: 1 1 18rem;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.links .muted {
+  flex-basis: 100%;
+  font-size: 0.8rem;
+}

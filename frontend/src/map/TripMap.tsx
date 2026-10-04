@@ -4,9 +4,17 @@ import 'leaflet/dist/leaflet.css'
 import 'leaflet.markercluster/dist/MarkerCluster.css'
 import { useEffect, useMemo } from 'react'
 import { CircleMarker, MapContainer, Pane, Polyline, TileLayer, useMap } from 'react-leaflet'
-import { photoUrl } from '../api.ts'
 import './map.css'
-import type { Located, Stop } from './route.ts'
+
+// What the map needs, and nothing more: the owner's trip page and a shared trip each
+// build these from their own data, so a shared map can't show what its data doesn't have.
+export type MapPoint = { id: string; lat: number; lon: number }
+export type MapMarker = MapPoint & {
+  thumb: string | null // image URLs, or null if the photo has no preview
+  web: string | null
+  title: string // hover text
+  lines: string[] // shown under the image in the popup
+}
 
 // OpenStreetMap's own tile servers: fine for development with attribution, not for a
 // deployed app's traffic (see the README). Changing provider is this URL.
@@ -14,8 +22,8 @@ const TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 
 type Props = {
-  stops: Stop[] // the route, in time order
-  markers: Located[] // every located photo, including undated ones
+  stops: MapPoint[] // the route, in time order
+  markers: MapMarker[] // every located photo, including undated ones
   current: number // index into stops: where the scrubber is
   onSelect: (photoId: string) => void
 }
@@ -69,7 +77,7 @@ function FollowPoint({ lat, lon }: { lat: number; lon: number }) {
  * Leaflet.markercluster isn't a React component, so this creates the layer itself and
  * rebuilds its markers when the photos change.
  */
-function PhotoClusters({ photos, onSelect }: { photos: Located[]; onSelect: (id: string) => void }) {
+function PhotoClusters({ photos, onSelect }: { photos: MapMarker[]; onSelect: (id: string) => void }) {
   const map = useMap()
   useEffect(() => {
     const layer = L.markerClusterGroup({
@@ -86,11 +94,11 @@ function PhotoClusters({ photos, onSelect }: { photos: Located[]; onSelect: (id:
       photos.map((p) => {
         const marker = L.marker([p.lat, p.lon], {
           icon: L.divIcon({
-            html: p.thumb_key ? `<img src="${photoUrl.thumb(p.id)}" alt="" loading="lazy">` : '',
+            html: p.thumb ? `<img src="${encodeURI(p.thumb)}" alt="" loading="lazy">` : '',
             className: 'photo-marker',
             iconSize: [40, 40],
           }),
-          title: p.original_filename ?? '',
+          title: p.title,
         })
         marker.bindPopup(() => popup(p), { minWidth: 200 })
         marker.on('click', () => onSelect(p.id))
@@ -106,25 +114,20 @@ function PhotoClusters({ photos, onSelect }: { photos: Located[]; onSelect: (id:
 }
 
 // Built as DOM nodes, not an HTML string, so a filename or place can't inject markup.
-function popup(p: Located) {
+function popup(p: MapMarker) {
   const box = document.createElement('div')
   box.className = 'photo-popup'
-  if (p.web_key) {
+  if (p.web && p.thumb) {
     const link = document.createElement('a')
-    link.href = photoUrl.web(p.id)
+    link.href = p.web
     link.target = '_blank'
     const img = document.createElement('img')
-    img.src = photoUrl.thumb(p.id)
-    img.alt = p.original_filename ?? ''
+    img.src = p.thumb
+    img.alt = p.title
     link.append(img)
     box.append(link)
   }
-  const lines = [
-    p.local_time ? `${p.local_time.slice(0, 10)} ${p.local_time.slice(11, 16)}` : 'No date',
-    [p.place_name, p.country_name].filter(Boolean).join(', '),
-    p.original_filename ?? '',
-  ]
-  for (const text of lines.filter(Boolean)) {
+  for (const text of p.lines.filter(Boolean)) {
     const line = document.createElement('div')
     line.textContent = text
     box.append(line)

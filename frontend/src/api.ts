@@ -180,6 +180,81 @@ export const settingsApi = {
   homes: () => api<Home[]>('/homes'),
   addHome: (home: Omit<Home, 'id'>) => send<Home>('POST', '/homes', home),
   removeHome: (id: string) => send('DELETE', `/homes/${id}`),
+  homeSuggestions: () => api<HomeSuggestion[]>('/homes/suggestions'),
+}
+
+// A place that looks like home: photos on many days, over weeks. Only the owner sees these.
+export type HomeSuggestion = {
+  lat: number
+  lon: number
+  place_name: string | null
+  day_count: number
+  first_day: string
+  last_day: string
+}
+
+// ---- Sharing
+
+export type Precision = 'city' | 'neighbourhood'
+
+export type Share = {
+  id: string
+  token: string
+  path: string // "/s/<token>": the link, on this site
+  precision: Precision
+  exact_dates: boolean
+  created_at: string
+  revoked_at: string | null
+}
+
+export type Sharing = {
+  shares: Share[]
+  can_share: boolean // false until a week after the trip's last photo
+  has_homes: boolean
+  hidden_near_home: number // photos a share leaves out because they're near a home
+  hidden_recent: number // ...or from the last week
+  shareable_from: string | null // when the trip can first be shared
+}
+
+export const sharesApi = {
+  forTrip: (tripId: string) => api<Sharing>(`/trips/${tripId}/shares`),
+  create: (tripId: string, precision: Precision, exactDates: boolean) =>
+    send<Share>('POST', `/trips/${tripId}/shares`, { precision, exact_dates: exactDates }),
+  revoke: (shareId: string) => send('DELETE', `/shares/${shareId}`),
+}
+
+// What anyone with a share link sees: snapped positions, day numbers, no filenames.
+export type SharedPhoto = {
+  id: string
+  lat: number | null
+  lon: number | null
+  place_name: string | null
+  country_name: string | null
+  has_preview: boolean
+  day: number | null // 1 is the trip's first day
+  time: string | null // "14:30", local time
+  local_time?: string | null // only if the owner chose exact dates
+}
+
+export type SharedTrip = {
+  name: string | null
+  precision: Precision
+  exact_dates: boolean
+  period: string | null // "July 2025"
+  start: string | null // only with exact dates
+  end: string | null
+  day_count: number
+  photo_count: number
+  distance_km: number
+  countries: { code: string; name: string | null; days: number }[]
+  places: { name: string; country_code: string | null; photos: number }[]
+  photos: SharedPhoto[]
+}
+
+export const sharedApi = {
+  trip: (token: string) => api<SharedTrip>(`/shared/${encodeURIComponent(token)}`),
+  thumb: (token: string, id: string) => `/api/shared/${encodeURIComponent(token)}/photos/${id}/thumb`,
+  web: (token: string, id: string) => `/api/shared/${encodeURIComponent(token)}/photos/${id}/web`,
 }
 
 export const photoUrl = {

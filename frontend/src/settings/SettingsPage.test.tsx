@@ -177,3 +177,22 @@ describe('helpers', () => {
     expect(formatShift(45)).toBe('45s')
   })
 })
+
+describe('home suggestions', () => {
+  it('offers a place that looks like home, and adds it on request', async () => {
+    const api = stubApi({
+      '/api/cameras': [], '/api/camera-offsets': [], '/api/homes': [],
+      '/api/homes/suggestions': [{
+        lat: 38.69735, lon: -9.21526, place_name: 'Belém', day_count: 6,
+        first_day: '2025-07-01', last_day: '2025-07-21',
+      }],
+    }, () => ({ status: 201, body: {} }))
+    renderWithApp(<SettingsPage />)
+    expect(await screen.findByText('Near Belém')).toBeInTheDocument()
+    expect(screen.getByText(/photos on 6 days/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Add as home' }))
+    await waitFor(() => expect(api.edits()).toEqual([{
+      method: 'POST', path: '/api/homes', body: { name: 'Belém', lat: 38.69735, lon: -9.21526, radius_km: 25 },
+    }]))
+  })
+})

@@ -3,7 +3,8 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react
 import { Link, useParams } from 'react-router'
 import { api, photoUrl, type Timeline } from '../api.ts'
 import { countryDays, listNames, plural, tripDates, tripTitle } from '../format.ts'
-import { distanceKm, duration, elevation, markers as locatedPhotos, route, tripPhotos } from './route.ts'
+import { distanceKm, duration, elevation, markers as locatedPhotos, photoMarker, route, tripPhotos } from './route.ts'
+import SharePanel from './SharePanel.tsx'
 import styles from './TripMapPage.module.css'
 
 // Leaflet is only needed on this page: loading it separately keeps the timeline fast.
@@ -25,10 +26,12 @@ export default function TripMapPage() {
 function TripView({ trip }: { trip: Timeline['trips'][number] }) {
   const stops = useMemo(() => route(trip), [trip])
   const markers = useMemo(() => locatedPhotos(trip), [trip])
+  const mapMarkers = useMemo(() => markers.map(photoMarker), [markers])
   const unlocated = tripPhotos(trip).length - markers.length
   // Start at the end, showing the whole trip; Play replays it from the start.
   const [current, setCurrent] = useState(Math.max(0, stops.length - 1))
   const [playing, setPlaying] = useState(false)
+  const [sharing, setSharing] = useState(false)
   const last = stops.length - 1
   const here = stops[Math.min(current, last)]
 
@@ -76,7 +79,11 @@ function TripView({ trip }: { trip: Timeline['trips'][number] }) {
   return (
     <div>
       <p><Link to="/">← Timeline</Link></p>
-      <h2 className={styles.title}>{tripTitle(trip)}</h2>
+      <div className={styles.heading}>
+        <h2 className={styles.title}>{tripTitle(trip)}</h2>
+        <button onClick={() => setSharing(!sharing)} aria-expanded={sharing}>Share…</button>
+      </div>
+      {sharing && <SharePanel tripId={trip.id} />}
       <dl className={styles.stats}>
         {stats.map(([label, value]) => (
           <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
@@ -87,7 +94,7 @@ function TripView({ trip }: { trip: Timeline['trips'][number] }) {
         <p className={styles.muted}>None of this trip's photos have a location, so there's nothing to map.</p>
       ) : (
         <Suspense fallback={<div className={styles.mapPlaceholder}>Loading map…</div>}>
-          <TripMap stops={stops} markers={markers} current={Math.min(current, last)} onSelect={select} />
+          <TripMap stops={stops} markers={mapMarkers} current={Math.min(current, last)} onSelect={select} />
         </Suspense>
       )}
 

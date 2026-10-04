@@ -23,6 +23,14 @@ export function formatDay(date: string) {
   return dayFormat.format(new Date(date))
 }
 
+// A moment (a timestamp like "2026-10-04T03:12:00Z", when something happened here), shown
+// in the viewer's own timezone, unlike the photo days above.
+const momentFormat = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+
+export function formatMoment(timestamp: string) {
+  return momentFormat.format(new Date(timestamp))
+}
+
 export function dateRange(first: string, last: string) {
   return first === last
     ? rangeFormat.format(new Date(first))
