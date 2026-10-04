@@ -1,6 +1,8 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
 .env
 uploads/
 .ruff_cache/
+# Downloaded place data (python -m app.geodata load)
+data/

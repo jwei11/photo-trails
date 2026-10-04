@@ -1,0 +1,64 @@
+.card {
+  margin: 0;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.media {
+  display: block;
+  aspect-ratio: 1;
+  background: var(--surface);
+}
+
+.media img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.noimg {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  padding: 0.5rem;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.card figcaption {
+  padding: 0.4rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  margin: 0.15rem 0.25rem 0 0;
+}
+
+.guess {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.info {
+  background: var(--info-bg);
+  color: var(--info-text);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+}

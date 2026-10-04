@@ -1,0 +1,96 @@
+/* Global styles only: page defaults, colour tokens, and form controls, which look the
+   same everywhere. Component styles live in *.module.css files next to each component. */
+:root {
+  --text: #1d1d1b;
+  --text-muted: #6b6a66;
+  --bg: #fafaf8;
+  --card: #fff;
+  --surface: #eeede8;
+  --border: #e3e1da;
+  --accent: #0f6e56;
+  --danger: #a32d2d;
+  --warn-bg: #faeeda;
+  --warn-text: #633806;
+  --info-bg: #e6f1fb;
+  --info-text: #0c447c;
+
+  font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #ecebe6;
+    --text-muted: #a09f99;
+    --bg: #1a1a19;
+    --card: #232321;
+    --surface: #2c2c29;
+    --border: #34332f;
+    --accent: #5dcaa5;
+    --danger: #f09595;
+    --warn-bg: #412402;
+    --warn-text: #fac775;
+    --info-bg: #042c53;
+    --info-text: #b5d4f4;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.25;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.6rem;
+}
+
+button,
+select {
+  background: var(--card);
+  cursor: pointer;
+}
+
+input {
+  background: var(--bg);
+}
+
+button:disabled,
+select:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.small,
+select.small {
+  font-size: 0.8rem;
+  padding: 0.1rem 0.4rem;
+}

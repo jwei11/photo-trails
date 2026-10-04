@@ -1,0 +1,18 @@
+.muted {
+  color: var(--text-muted);
+  font-weight: normal;
+}
+
+.error {
+  color: var(--danger);
+}
+
+.loose {
+  margin-top: 2rem;
+  padding-top: 0.5rem;
+  border-top: 2px solid var(--border);
+}
+
+.loose h2 {
+  margin: 0.25rem 0 0;
+}
