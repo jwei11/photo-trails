@@ -50,7 +50,7 @@ def client(migrated_db):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE users, sessions, login_links, photos, camera_clock_offsets, trips, homes, "
+                "TRUNCATE users, sessions, login_links, shares, photos, camera_clock_offsets, trips, homes, "
                 "imports, import_items, places, admin1_regions, countries, jobs"
             )
         )

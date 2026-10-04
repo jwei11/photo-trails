@@ -6,16 +6,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, imports, objects, storage, trip_store
+from app import auth, imports, objects, shares, storage, trip_store
 from app.config import APP_ORIGINS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -387,6 +388,12 @@ def list_homes(user: CurrentUser):
     return trip_store.list_homes(user.id)
 
 
+@api.get("/homes/suggestions")
+def home_suggestions(user: CurrentUser):
+    """Places that look like home (photos on many days over weeks), not yet a home."""
+    return trip_store.suggest_homes(user.id)
+
+
 @api.post("/homes", status_code=201)
 def add_home(body: HomeIn, user: CurrentUser):
     return trip_store.add_home(user.id, body.model_dump())
@@ -396,6 +403,69 @@ def add_home(body: HomeIn, user: CurrentUser):
 def delete_home(home_id: uuid.UUID, user: CurrentUser):
     _trip_errors(trip_store.delete_home, user.id, str(home_id))
     return Response(status_code=204)
+
+
+# ---- Sharing --------------------------------------------------------------------------
+
+class ShareIn(BaseModel):
+    precision: Literal["city", "neighbourhood"] = "city"
+    exact_dates: bool = False
+
+
+def _share_errors(fn, *args):
+    try:
+        return fn(*args)
+    except shares.NotFound:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@api.get("/trips/{trip_id}/shares")
+def trip_sharing(trip_id: uuid.UUID, user: CurrentUser):
+    return _share_errors(shares.sharing, user.id, str(trip_id))
+
+
+@api.post("/trips/{trip_id}/shares", status_code=201)
+def create_share(trip_id: uuid.UUID, body: ShareIn, user: CurrentUser):
+    try:
+        return _share_errors(shares.create_share, user.id, str(trip_id), body.precision, body.exact_dates)
+    except shares.TooRecent as exc:
+        when = exc.shareable_from
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Trips can be shared a week after they end, so a link never says you're away "
+                f"right now. This one can be shared from {when:%B} {when.day}."
+                if when else "This trip has no dated photos to share."
+            ),
+        )
+
+
+@api.delete("/shares/{share_id}", status_code=204)
+def revoke_share(share_id: uuid.UUID, user: CurrentUser):
+    _share_errors(shares.revoke_share, user.id, str(share_id))
+    return Response(status_code=204)
+
+
+# The public side: no session, just the link's token. Not cached and not indexed, so a
+# revoked link stops working at once and never shows up in a search engine.
+PUBLIC_HEADERS = {"Cache-Control": "no-store", "X-Robots-Tag": "noindex"}
+
+
+@api.get("/shared/{token}")
+def shared_trip(token: str):
+    view = _share_errors(shares.public_view, token)
+    return JSONResponse(jsonable_encoder(view), headers=PUBLIC_HEADERS)
+
+
+@api.get("/shared/{token}/photos/{photo_id}/{kind}")
+def shared_photo(token: str, photo_id: uuid.UUID, kind: Literal["thumb", "web"]):
+    key = _share_errors(shares.public_photo_key, token, str(photo_id), kind)
+    # Only ever a derivative (re-encoded, no metadata), never the original file. The signed
+    # URL works for an hour; the browser may reuse this redirect for five minutes.
+    return RedirectResponse(
+        objects.download_url(key), status_code=302,
+        headers={"Cache-Control": "private, max-age=300", "X-Robots-Tag": "noindex"},
+    )
 
 
 @api.get("/cameras")

@@ -1,4 +1,7 @@
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
+
+import h3
 
 from sqlalchemy import Connection, text
 
@@ -222,3 +225,64 @@ def delete_home(user_id: str, home_id: str) -> None:
         if not deleted:
             raise NotFound
         storage.regroup_trips(conn, user_id)
+
+
+# Home detection. Where you live is where photos pile up over months: many different days,
+# spread over weeks, in one small area. A trip has many photos in one place too, but on a
+# few consecutive days. Photos are binned into ~0.9 km hexagons, and each is scored with
+# its six neighbours (about 3 km across), so a home near a hexagon's edge isn't split.
+HOME_H3_RES = 8
+HOME_MIN_DAYS = 5
+HOME_MIN_SPAN = timedelta(days=14)
+MAX_HOME_SUGGESTIONS = 3
+
+
+def suggest_homes(user_id: str) -> list[dict]:
+    """Places that look like home and aren't covered by a home yet, best first. Only ever
+    shown to the owner, who decides: nothing is hidden or regrouped until they add one."""
+    with engine.connect() as conn:
+        photos = conn.execute(
+            text(
+                """
+                SELECT p.lat, p.lon, p.shot_at, p.local_offset_min, pl.name AS place_name
+                FROM photos p LEFT JOIN places pl ON pl.geonameid = p.place_id
+                WHERE p.user_id = :user AND p.status = 'ready'
+                  AND p.lat IS NOT NULL AND p.shot_at IS NOT NULL
+                """
+            ),
+            {"user": user_id},
+        ).all()
+        homes = [
+            trips.Home(r.lat, r.lon, r.radius_km)
+            for r in conn.execute(text("SELECT lat, lon, radius_km FROM homes WHERE user_id = :user"), {"user": user_id})
+        ]
+
+    days: dict[str, set] = defaultdict(set)
+    names: dict[str, Counter] = defaultdict(Counter)
+    for p in photos:
+        if any(trips.haversine_km(p.lat, p.lon, h.lat, h.lon) <= h.radius_km for h in homes):
+            continue
+        cell = h3.latlng_to_cell(p.lat, p.lon, HOME_H3_RES)
+        days[cell].add((p.shot_at + timedelta(minutes=p.local_offset_min)).date())
+        if p.place_name:
+            names[cell][p.place_name] += 1
+
+    def around(cell: str) -> set:
+        return set().union(*(days.get(c, set()) for c in h3.grid_disk(cell, 1)))
+
+    scored = sorted(((len(around(c)), c) for c in days), reverse=True)
+    suggestions, taken = [], set()
+    for n_days, cell in scored:
+        area_days = around(cell)
+        if cell in taken or n_days < HOME_MIN_DAYS or max(area_days) - min(area_days) < HOME_MIN_SPAN:
+            continue
+        taken |= set(h3.grid_disk(cell, 2))  # one suggestion per area
+        lat, lon = h3.cell_to_latlng(cell)
+        place = sum((names[c] for c in h3.grid_disk(cell, 1)), Counter()).most_common(1)
+        suggestions.append({
+            "lat": round(lat, 5), "lon": round(lon, 5), "place_name": place[0][0] if place else None,
+            "day_count": n_days, "first_day": min(area_days), "last_day": max(area_days),
+        })
+        if len(suggestions) == MAX_HOME_SUGGESTIONS:
+            break
+    return suggestions

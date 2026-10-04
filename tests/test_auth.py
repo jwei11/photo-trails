@@ -20,9 +20,9 @@ from tests.test_api import add_offset, jpeg, upload
 from tests.test_imports import describe, start_import
 from tests.test_trips_api import shoot
 
-# Signing in and out are the only API routes open to anyone.
+# Signing in and out, and share links, are the only API routes open to anyone.
 PUBLIC = {"/api/auth/me", "/api/auth/google/start", "/api/auth/google/callback", "/api/auth/link",
-          "/api/auth/logout"}
+          "/api/auth/logout", "/api/shared/{token}", "/api/shared/{token}/photos/{photo_id}/{kind}"}
 
 
 def api_routes():
