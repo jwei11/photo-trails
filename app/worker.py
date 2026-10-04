@@ -43,7 +43,7 @@ def process_photo(payload: dict) -> None:
         # The row is gone. Usually an expired upload; but a run that found a duplicate deletes
         # its row before recording "duplicate", so if it crashed in between, this rerun lands
         # here. The original's bytes were verified then; match it now by the declared hash.
-        original = storage.find_by_hashes([payload["sha256"]]).get(payload["sha256"]) if payload.get("sha256") else None
+        original = _original_for(payload)
         if original:
             outcome = ("duplicate", None, None, original)
         else:
@@ -55,6 +55,23 @@ def process_photo(payload: dict) -> None:
         imports.record_outcome(item_id, *outcome)
 
 
+def _original_for(payload: dict) -> str | None:
+    """The importing user's photo with the declared hash, if any."""
+    if not payload.get("sha256") or not payload.get("item_id"):
+        return None
+    with engine.connect() as conn:
+        user_id = conn.execute(
+            text(
+                "SELECT i.user_id FROM imports i JOIN import_items it ON it.import_id = i.id "
+                "WHERE it.id = :item"
+            ),
+            {"item": payload["item_id"]},
+        ).scalar_one_or_none()
+    if user_id is None:
+        return None
+    return storage.find_by_hashes(str(user_id), [payload["sha256"]]).get(payload["sha256"])
+
+
 def gave_up_on_photo(payload: dict, error: str) -> None:
     storage.mark_failed(payload["photo_id"], error)
     if payload.get("item_id"):
@@ -63,8 +80,8 @@ def gave_up_on_photo(payload: dict, error: str) -> None:
 
 def regroup_trips(payload: dict) -> None:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
-        storage.regroup_trips(conn)
+        storage.lock_writes(conn, payload["user_id"])
+        storage.regroup_trips(conn, payload["user_id"])
 
 
 def sweep(payload: dict) -> None:

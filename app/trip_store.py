@@ -14,20 +14,20 @@ class InvalidEdit(Exception):
     pass
 
 
-def list_trips() -> list[dict]:
+def list_trips(user_id: str) -> list[dict]:
     with engine.connect() as conn:
-        return _trips_with_stats(conn)
+        return _trips_with_stats(conn, user_id)
 
 
-def get_trip(trip_id: str) -> dict:
+def get_trip(user_id: str, trip_id: str) -> dict:
     with engine.connect() as conn:
-        found = [t for t in _trips_with_stats(conn, trip_id) if t["id"] == trip_id]
+        found = [t for t in _trips_with_stats(conn, user_id, trip_id) if t["id"] == trip_id]
     if not found:
         raise NotFound
     return found[0]
 
 
-def _trips_with_stats(conn: Connection, only: str | None = None) -> list[dict]:
+def _trips_with_stats(conn: Connection, user_id: str, only: str | None = None) -> list[dict]:
     rows = conn.execute(
         text(
             """
@@ -37,10 +37,10 @@ def _trips_with_stats(conn: Connection, only: str | None = None) -> list[dict]:
                        AS country_name
             FROM trips t JOIN photos p ON p.trip_id = t.id
             LEFT JOIN places pl ON pl.geonameid = p.place_id
-            WHERE CAST(:only AS uuid) IS NULL OR t.id = CAST(:only AS uuid)
+            WHERE t.user_id = :user AND (CAST(:only AS uuid) IS NULL OR t.id = CAST(:only AS uuid))
             """
         ),
-        {"only": only},
+        {"user": user_id, "only": only},
     ).all()
     by_trip: dict[str, dict] = {}
     for r in rows:
@@ -79,9 +79,12 @@ def _trips_with_stats(conn: Connection, only: str | None = None) -> list[dict]:
     return result
 
 
-def _require_trips(conn: Connection, ids: list[str]) -> None:
+def _require_trips(conn: Connection, user_id: str, ids: list[str]) -> None:
+    """Every id is a trip of this user's. Another user's trip is "not found", exactly like
+    one that doesn't exist, so trying ids reveals nothing."""
     found = conn.execute(
-        text("SELECT count(*) FROM trips WHERE id = ANY(CAST(:ids AS uuid[]))"), {"ids": ids}
+        text("SELECT count(*) FROM trips WHERE user_id = :user AND id = ANY(CAST(:ids AS uuid[]))"),
+        {"user": user_id, "ids": ids},
     ).scalar_one()
     if found != len(set(ids)):
         raise NotFound
@@ -93,39 +96,39 @@ def _lock_trips(conn: Connection, ids: list[str]) -> None:
     )
 
 
-def rename_trip(trip_id: str, name: str | None) -> dict:
+def rename_trip(user_id: str, trip_id: str, name: str | None) -> dict:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
-        _require_trips(conn, [trip_id])
+        storage.lock_writes(conn, user_id)
+        _require_trips(conn, user_id, [trip_id])
         conn.execute(
             text("UPDATE trips SET name = :name, is_locked = true WHERE id = :id"),
             {"id": trip_id, "name": name},
         )
-        storage.regroup_trips(conn)
-    return get_trip(trip_id)
+        storage.regroup_trips(conn, user_id)
+    return get_trip(user_id, trip_id)
 
 
-def merge_trips(target_id: str, other_ids: list[str]) -> dict:
+def merge_trips(user_id: str, target_id: str, other_ids: list[str]) -> dict:
     others = [i for i in other_ids if i != target_id]
     if not others:
         raise InvalidEdit("Choose at least one other trip to merge in.")
     with engine.begin() as conn:
-        storage.lock_writes(conn)
-        _require_trips(conn, [target_id, *others])
+        storage.lock_writes(conn, user_id)
+        _require_trips(conn, user_id, [target_id, *others])
         conn.execute(
             text("UPDATE photos SET trip_id = :target WHERE trip_id = ANY(CAST(:others AS uuid[]))"),
             {"target": target_id, "others": others},
         )
         conn.execute(text("DELETE FROM trips WHERE id = ANY(CAST(:others AS uuid[]))"), {"others": others})
         _lock_trips(conn, [target_id])
-        storage.regroup_trips(conn)
-    return get_trip(target_id)
+        storage.regroup_trips(conn, user_id)
+    return get_trip(user_id, target_id)
 
 
-def split_trip(trip_id: str, at: datetime) -> tuple[dict, dict]:
+def split_trip(user_id: str, trip_id: str, at: datetime) -> tuple[dict, dict]:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
-        _require_trips(conn, [trip_id])
+        storage.lock_writes(conn, user_id)
+        _require_trips(conn, user_id, [trip_id])
         before, after = conn.execute(
             text(
                 """
@@ -139,69 +142,83 @@ def split_trip(trip_id: str, at: datetime) -> tuple[dict, dict]:
         if not before or not after:
             raise InvalidEdit("The split point must leave photos on both sides.")
         new_id = str(
-            conn.execute(text("INSERT INTO trips (is_locked) VALUES (true) RETURNING id")).scalar_one()
+            conn.execute(
+                text("INSERT INTO trips (user_id, is_locked) VALUES (:user, true) RETURNING id"),
+                {"user": user_id},
+            ).scalar_one()
         )
         conn.execute(
             text("UPDATE photos SET trip_id = :new WHERE trip_id = :id AND shot_at >= :at"),
             {"id": trip_id, "new": new_id, "at": at},
         )
         _lock_trips(conn, [trip_id])
-        storage.regroup_trips(conn)
-    return get_trip(trip_id), get_trip(new_id)
+        storage.regroup_trips(conn, user_id)
+    return get_trip(user_id, trip_id), get_trip(user_id, new_id)
 
 
-def dissolve_trip(trip_id: str) -> None:
+def dissolve_trip(user_id: str, trip_id: str) -> None:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
-        _require_trips(conn, [trip_id])
+        storage.lock_writes(conn, user_id)
+        _require_trips(conn, user_id, [trip_id])
         conn.execute(
             text("UPDATE photos SET trip_id = NULL, trip_pinned = true WHERE trip_id = :id"),
             {"id": trip_id},
         )
         conn.execute(text("DELETE FROM trips WHERE id = :id"), {"id": trip_id})
-        storage.regroup_trips(conn)
+        storage.regroup_trips(conn, user_id)
 
 
-def move_photo(photo_id: str, trip_id: str | None) -> None:
+def move_photo(user_id: str, photo_id: str, trip_id: str | None) -> None:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
+        storage.lock_writes(conn, user_id)
         previous = conn.execute(
-            text("SELECT trip_id FROM photos WHERE id = :id"), {"id": photo_id}
+            text("SELECT trip_id FROM photos WHERE id = :id AND user_id = :user"),
+            {"id": photo_id, "user": user_id},
         ).first()
         if previous is None:
             raise NotFound
         if trip_id:
-            _require_trips(conn, [trip_id])
+            _require_trips(conn, user_id, [trip_id])
         conn.execute(
             text("UPDATE photos SET trip_id = :trip, trip_pinned = true WHERE id = :id"),
             {"id": photo_id, "trip": trip_id},
         )
         _lock_trips(conn, [str(t) for t in (previous.trip_id, trip_id) if t])
-        storage.regroup_trips(conn)
+        storage.regroup_trips(conn, user_id)
 
 
-def list_homes() -> list[dict]:
+HOME_COLUMNS = "id, name, lat, lon, radius_km, created_at"
+
+
+def list_homes(user_id: str) -> list[dict]:
     with engine.connect() as conn:
-        return [dict(r._mapping) for r in conn.execute(text("SELECT * FROM homes ORDER BY created_at"))]
+        rows = conn.execute(
+            text(f"SELECT {HOME_COLUMNS} FROM homes WHERE user_id = :user ORDER BY created_at"),
+            {"user": user_id},
+        )
+        return [dict(r._mapping) for r in rows]
 
 
-def add_home(values: dict) -> dict:
+def add_home(user_id: str, values: dict) -> dict:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
+        storage.lock_writes(conn, user_id)
         row = conn.execute(
             text(
-                "INSERT INTO homes (name, lat, lon, radius_km) "
-                "VALUES (:name, :lat, :lon, :radius_km) RETURNING *"
+                "INSERT INTO homes (user_id, name, lat, lon, radius_km) "
+                f"VALUES (:user, :name, :lat, :lon, :radius_km) RETURNING {HOME_COLUMNS}"
             ),
-            values,
+            {**values, "user": user_id},
         ).one()
-        storage.regroup_trips(conn)
+        storage.regroup_trips(conn, user_id)
     return dict(row._mapping)
 
 
-def delete_home(home_id: str) -> None:
+def delete_home(user_id: str, home_id: str) -> None:
     with engine.begin() as conn:
-        storage.lock_writes(conn)
-        if not conn.execute(text("DELETE FROM homes WHERE id = :id"), {"id": home_id}).rowcount:
+        storage.lock_writes(conn, user_id)
+        deleted = conn.execute(
+            text("DELETE FROM homes WHERE id = :id AND user_id = :user"), {"id": home_id, "user": user_id}
+        ).rowcount
+        if not deleted:
             raise NotFound
-        storage.regroup_trips(conn)
+        storage.regroup_trips(conn, user_id)

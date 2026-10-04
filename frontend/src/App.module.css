@@ -44,3 +44,19 @@
   background: var(--info-bg);
   color: var(--info-text);
 }
+
+.account {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.signOut {
+  margin-left: 0.5rem;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}

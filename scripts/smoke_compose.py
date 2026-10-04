@@ -4,21 +4,25 @@ uses it. Run against a fresh stack, from the repo root:
     docker compose up -d --build --wait
     python3 scripts/smoke_compose.py [--api http://localhost:8000]
 
-It uploads one small photo and leaves it there (there's no delete), so it refuses to run
-against a stack that already has photos. Standard library only: it runs on the host,
-which needs nothing installed but Docker and Python 3.
+It creates a user and uploads one small photo, and leaves them there (there's no delete),
+so it refuses to run against a stack that already has users. Standard library only: it
+runs on the host, which needs nothing installed but Docker and Python 3.
 
 Checks, in order:
-1. The API answers /healthz, and serves the React app at /.
+1. The API answers /healthz, serves the React app at /, and refuses API calls from
+   someone not signed in.
 2. The image runs as a non-root user and has no C compiler.
-3. An import, as the browser does it: register the file, PUT it to the presigned URL the
+3. A user created with `python -m app.users` in the API container can sign in with the
+   one-time link it prints.
+4. An import, as the browser does it: register the file, PUT it to the presigned URL the
    API returns (proving that URL is signed for a host reachable from outside Docker),
    mark it complete, and wait for the worker container to process it.
-4. The thumbnail redirects to a presigned URL that serves a WebP image.
-5. The photo's GPS time and place were resolved.
+5. The thumbnail redirects to a presigned URL that serves a WebP image.
+6. The photo's GPS time and place were resolved.
 """
 import argparse
 import base64
+import re
 import hashlib
 import json
 import os
@@ -53,9 +57,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# The session cookie, sent only to the API (never to storage), once signed in.
+SESSION = {"api": None, "cookie": None}
+
+
 def request(method, url, body=None, headers=None, follow=True):
     data = json.dumps(body).encode() if isinstance(body, (dict, list)) else body
     headers = {"Content-Type": "application/json", **(headers or {})} if isinstance(body, (dict, list)) else headers or {}
+    if SESSION["cookie"] and url.startswith(SESSION["api"] + "/"):
+        headers = {**headers, "Cookie": SESSION["cookie"]}
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     opener = urllib.request.build_opener() if follow else urllib.request.build_opener(NoRedirect)
     try:
@@ -106,9 +116,9 @@ def main():
     wait_for("/healthz", healthy, timeout=60)
     status, headers, _ = request("GET", f"{api}/")
     check(status == 200 and "text/html" in headers.get("content-type", ""), f"/ -> {status}, not the React app")
-    step("API is healthy and serves the React app")
-
-    check(get_json(f"{api}/api/photos") == [], "this stack already has photos; run against a fresh one")
+    status, _, _ = request("GET", f"{api}/api/photos")
+    check(status == 401, f"GET /api/photos without signing in -> {status}, not 401")
+    step("API is healthy, serves the React app, and refuses callers who aren't signed in")
 
     # 2. What's inside the image.
     inside = subprocess.run(
@@ -119,7 +129,24 @@ def main():
     check(inside[1:] == [], f"the image has a compiler: {inside[1:]}")
     step(f"image runs as uid {inside[0]} and has no compiler")
 
-    # 3. Import one photo the way the browser does.
+    # 3. An account, and signing in with a one-time link.
+    def users_command(*args):
+        return subprocess.run(
+            ["docker", "compose", "exec", "-T", "api", "python", "-m", "app.users", *args],
+            capture_output=True, text=True, check=True,
+        ).stdout
+
+    check(users_command("list").strip() == "", "this stack already has users; run against a fresh one")
+    out = users_command("create", "smoke@example.com", "--login-link")
+    token = re.search(r"/login\?link=(\S+)", out)
+    check(token is not None, f"no sign-in link in: {out!r}")
+    status, headers, body = request("POST", f"{api}/api/auth/link", {"token": token.group(1)})
+    check(status == 200, f"POST /api/auth/link -> {status}: {body[:200]!r}")
+    SESSION.update(api=api, cookie=headers["set-cookie"].split(";", 1)[0])
+    check(get_json(f"{api}/api/auth/me")["user"]["email"] == "smoke@example.com", "not signed in after the link")
+    step("created a user and signed in with a one-time link")
+
+    # 4. Import one photo the way the browser does.
     sha = hashlib.sha256(PHOTO).hexdigest()
     status, _, body = request("POST", f"{api}/api/imports", {"files": [
         {"filename": "smoke.jpg", "content_type": "image/jpeg", "size_bytes": len(PHOTO), "sha256": sha},
@@ -142,7 +169,7 @@ def main():
     done = wait_for("the worker to process the photo", processed, timeout=60)
     step("the worker processed the photo")
 
-    # 4. The thumbnail: a redirect to a presigned URL, which serves the image.
+    # 5. The thumbnail: a redirect to a presigned URL, which serves the image.
     status, headers, _ = request("GET", f"{api}/api/photos/{done['photo_id']}/thumb", follow=False)
     check(status in (302, 307), f"/thumb -> {status}, expected a redirect")
     status, headers, body = request("GET", headers["location"])
@@ -150,7 +177,7 @@ def main():
           f"thumbnail URL -> {status} {headers.get('content-type')}")
     step(f"thumbnail served from storage ({len(body)} bytes of WebP)")
 
-    # 5. Time and place.
+    # 6. Time and place.
     photo = get_json(f"{api}/api/photos/{done['photo_id']}/metadata")
     check(photo["shot_at"] is not None and photo["tz_name"] == "Europe/Lisbon", f"time not resolved: {photo}")
     place = photo.get("place_name")

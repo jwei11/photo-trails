@@ -21,6 +21,11 @@ x-app-env: &app-env
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set it in .env}
   S3_SECRET_KEY: ${S3_SECRET_KEY:?set it in .env}
   APP_ORIGINS: ${APP_ORIGINS:-http://localhost:8000}
+  # Optional: sign in with Google (see README). Without it, sign in with a one-time link.
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  # Read only by migration 0010, to give a database's existing photos an owner.
+  OWNER_EMAIL: ${OWNER_EMAIL:-}
 
 # One image runs four services with different commands. Only the api service builds it:
 # if each had `build: .`, compose would build the same image four times over. The others

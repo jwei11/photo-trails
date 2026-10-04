@@ -50,10 +50,33 @@ def client(migrated_db):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE photos, camera_clock_offsets, trips, homes, imports, import_items, "
-                "places, admin1_regions, countries, jobs"
+                "TRUNCATE users, sessions, login_links, photos, camera_clock_offsets, trips, homes, "
+                "imports, import_items, places, admin1_regions, countries, jobs"
             )
         )
     with TestClient(app) as c:  # startup creates the test bucket if needed
         objects.delete(*(key for key, _ in objects.list_keys()))
+        sign_in(c, "a@example.com")
+        yield c
+
+
+def sign_in(client, email: str):
+    """Create the user (if needed) and give this client a session for them, as signing in
+    would. Returns the user."""
+    from app import auth
+
+    user = auth.find_user(email) or auth.create_user(email)
+    client.cookies.set(auth.SESSION_COOKIE, auth.create_session(user.id))
+    return user
+
+
+@pytest.fixture
+def other_client(client):
+    """A second browser, signed in as a different user, B."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as c:
+        sign_in(c, "b@example.com")
         yield c

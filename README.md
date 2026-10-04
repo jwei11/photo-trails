@@ -14,9 +14,11 @@ Needs Docker with Compose, and nothing else: no Python, Node, or AWS account.
 git clone <this repo> && cd photo-trails
 cp .env.example .env     # then replace every change-me (letters and digits only)
 docker compose up --build
+# in another terminal, once it's up: create your account and print a one-time sign-in link
+docker compose exec api python -m app.users create you@example.com --login-link
 ```
 
-Open http://localhost:8000. The first start builds the image (about a minute), applies the database migrations, and downloads and loads the place data in the background (about 23 MB; photos get place names once it's done). Photos are stored in the local SeaweedFS. To use an Amazon S3 bucket instead, see **Photo storage** below. Stop with Ctrl-C, or `docker compose down` if it was started with `-d`. The data stays in Docker volumes until `docker compose down -v`.
+Open the printed link (it's valid for 15 minutes) and press the button to sign in. The first start builds the image (about a minute), applies the database migrations, and downloads and loads the place data in the background (about 23 MB; photos get place names once it's done). Photos are stored in the local SeaweedFS. To use an Amazon S3 bucket instead, see **Photo storage** below. Stop with Ctrl-C, or `docker compose down` if it was started with `-d`. The data stays in Docker volumes until `docker compose down -v`.
 
 ```
            browser: http://localhost:8000 (app + API)   http://localhost:8333 (signed photo URLs)
@@ -43,6 +45,7 @@ docker compose up -d --wait db objects  # Postgres + PostGIS, and local S3-compa
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/alembic upgrade head  # apply migrations
 .venv/bin/python -m app.geodata load    # place data, once (downloads to data/geo/)
+.venv/bin/python -m app.users create you@example.com --login-link  # your account
 .venv/bin/uvicorn app.main:app --reload
 .venv/bin/python -m app.worker  # in another terminal: processes uploads in the background
 ```
@@ -58,6 +61,10 @@ cd frontend && npm install && npm run dev
 ```
 
 To serve it from the API instead, as in production, build it once with `npm run build` and open http://localhost:8000. The API docs are at http://localhost:8000/docs.
+
+**Accounts** are invite-only: there's no sign-up page. Invite someone with `python -m app.users create their@email` (inside Docker: `docker compose exec api python -m app.users ...`), and they sign in with Google using that address. `python -m app.users login-link their@email` prints a one-time link instead, which works without Google; the links point at the first `APP_ORIGINS` entry. A database from before accounts (M10 or earlier) needs an owner for its photos: run that one migration as `OWNER_EMAIL=you@example.com .venv/bin/alembic upgrade head`, and it creates that user and gives them everything.
+
+**Sign in with Google** is optional and set up once in the Google Cloud console (free, no billing account needed): create a project; under Google Auth Platform, set up Branding (app name, your email), set Audience to External and leave it in Testing with yourself and your invitees added as test users; then under Clients, create an OAuth client of type Web application with the authorized redirect URIs `http://localhost:8000/api/auth/google/callback` and `http://localhost:5173/api/auth/google/callback`. Put its client ID and secret in `.env` as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. The app asks Google only for `openid email`.
 
 **Photo storage** is the local SeaweedFS by default. To use an Amazon S3 bucket, set one up once in the AWS console, before anything else: a billing budget (the Zero spend template plus a small monthly one), then a bucket in `S3_REGION` with Block all public access on, a CORS rule allowing `GET` and `PUT` with a `content-type` header from `http://localhost:5173` and `http://localhost:8000`, and an IAM user whose only permissions are `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on its objects. Put that user's access key in `.env`, with `S3_ENDPOINT` and `DOCKER_S3_ENDPOINT` both empty (see `.env.example`). The app checks it can reach the bucket at startup and says why if it can't. To copy photos from SeaweedFS into the bucket: `.venv/bin/python -m app.copy_storage --dry-run`, then without `--dry-run`. It's safe to re-run and never deletes anything.
 
@@ -244,6 +251,16 @@ The logic is in `app/trips.py` (pure functions, `tests/test_trips.py`), and the 
 
 **Still no Redis (M10).** The guide's compose file lists Redis, but background jobs are a Postgres table (see "Background jobs are rows in a Postgres table"), so nothing would use it.
 
+**Sign in with Google, then our own session (M11).** Google proves who someone is; after that the app keeps its own session: a random 256-bit token in a cookie, with only its SHA-256 stored in a `sessions` table. Signing out deletes the row, so it ends at once. The cookie is `HttpOnly` (page scripts, including injected ones, can't read it) and `SameSite=Lax`. The Google step is the OpenID Connect authorization code flow, written by hand with `httpx` (about 80 lines, no new dependency): a `state` value in a short-lived cookie ties Google's answer to the browser that started it, a `nonce` ties the ID token to this sign-in, and PKCE means an intercepted code is useless on its own. The ID token's signature isn't checked, because it comes straight from Google's token endpoint over HTTPS in answer to our request, which the spec accepts instead (OpenID Connect Core, 3.1.3.7); its issuer, audience, expiry, nonce, and `email_verified` are. Rejected: JWTs as the session (can't be revoked before they expire without a deny-list, which is a session table again), a password of our own (storing password hashes and handling resets, for no gain when everyone has Google), and a managed service like Cognito or Auth0 (least code but least to explain, and tests would have to fake it).
+
+**Accounts are invite-only (M11).** There's no sign-up page: `python -m app.users create <email>` makes an account, and Google sign-in only matches an existing one, by verified email. Once deployed, a stranger can't sign up and fill the S3 bucket, and the upload path isn't open to the internet. For setups without Google (a fresh clone, the smoke test), the same command prints a one-time sign-in link: valid 15 minutes, stored hashed, spent on use. The link opens a page with a button rather than signing in on GET, because mail scanners and chat previews fetch links, and would use it up. Rejected: open sign-up (needs quotas, rate limits, and abuse handling first), and an allow-list behind a sign-up page (the same protection with more code).
+
+**One user can never see another's data, enforced three ways (M11).** Every table with user data has a `user_id`, and every query filters by the signed-in user, passed explicitly from the route down (there's no global "current user"). Another user's photo or trip is a 404, the same as one that doesn't exist, so trying ids reveals nothing. Behind that, the database itself refuses some mix-ups: a photo's trip is a foreign key on `(trip_id, user_id)`, so a photo can't be put in another user's trip even by a buggy query. And tests: one walks every API route and checks each refuses a request with no session (so a new route can't forget), and others have user B try to read and change each of user A's things. Breaking the owner check in `get_photo` or `_require_trips` makes them fail. Duplicate detection is per user too: a shared one would tell B "already imported", revealing that A has the photo.
+
+**Each user's writes are serialized separately (M11).** Writes take a Postgres advisory lock because they end by recomputing times and trips from all of a user's photos. That lock is now per user (shared global key, plus an exclusive one for the user), so one person's import doesn't wait for another's. Reloading place data, which touches everyone's photos, takes the global key exclusively.
+
+**Cross-site requests are refused twice over (M11).** `SameSite=Lax` keeps the cookie off POSTs started by other sites, and a middleware also refuses any change (POST, PUT, PATCH, DELETE) whose `Origin` header isn't one of `APP_ORIGINS`. Browsers always send `Origin` on those, and a page can't fake it. The second check covers what SameSite doesn't: sibling subdomains count as the same site, and some older browsers ignore it.
+
 ## Performance baseline (M3, synchronous processing)
 
 Measured on an Apple Silicon Mac, with the client and server on the same machine (so no network transfer time):
@@ -349,7 +366,8 @@ The upload is 10% of each photo's time; the browser spends the rest waiting on `
 - A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
 - The worker downloads each original into memory to process it (as `complete` did before M8). Fine for photos up to the 200 MB limit, but four threads processing large files at once need several hundred MB.
-- Anyone can request upload URLs: there are no accounts until M11. The 200 MB per-file cap limits the damage, not the count.
+- There are no upload quotas: an invited user can upload as much as they like. The 200 MB per-file cap limits a single file, not the total.
+- Sessions last 30 days and there's no "sign out everywhere" or list of active sessions yet; deleting a user's rows from `sessions` does it.
 - `POST /api/photos` rejects files over 200 MB before reading them into memory, but the web framework has already saved the whole request to a temporary file on disk by then, so a huge upload still costs disk space. Presigned uploads don't have this problem, since the file never reaches the API.
 - Uploads are limited to `image/*` (except SVG, which can contain script) and `application/octet-stream`, because the stored type is served back to browsers. Photos uploaded before this rule keep whatever type they were given.
 - The browser reads each file fully into memory to hash it (Web Crypto has no streaming hash). Fine for photos, but a 200 MB file briefly costs 200 MB of browser memory. Hashing also needs a secure context (HTTPS or localhost).

@@ -121,7 +121,7 @@ def test_a_failed_replace_keeps_the_old_offset(client, monkeypatch):
 
     assert add_offset(client).status_code == 201
 
-    def broken(conn):
+    def broken(conn, user_id):
         raise RuntimeError("recompute failed")
 
     monkeypatch.setattr(storage, "resolve_times", broken)  # fails after the delete and insert

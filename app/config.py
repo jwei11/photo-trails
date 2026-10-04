@@ -33,3 +33,8 @@ APP_ORIGINS = [
     for origin in os.environ.get("APP_ORIGINS", "http://localhost:5173,http://localhost:8000").split(",")
     if origin.strip()
 ]
+
+# Sign in with Google: an OAuth client from Google Cloud (see README). Without them, the
+# only way to sign in is a one-time link from `python -m app.users login-link`.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID") or None
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET") or None

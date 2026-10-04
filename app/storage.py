@@ -32,19 +32,23 @@ PHOTO_COLUMNS = """
 WRITE_LOCK = 3_141_592
 
 
-def lock_writes(conn: Connection) -> None:
-    """Serialize write transactions. Call first, before reading anything the write depends on.
+def lock_writes(conn: Connection, user_id: str | None = None) -> None:
+    """Serialize one user's write transactions, or with no user, everyone's. Call first,
+    before reading anything the write depends on.
 
-    Every write ends by recomputing times and trips from the whole photo set, so two writes
-    running at once could each compute from a stale view and overwrite the other's result.
+    Every write ends by recomputing a user's times and trips from all their photos, so two
+    writes running at once could each compute from a stale view and overwrite the other's
+    result. Different users' photos never mix, so their writes don't wait for each other:
+    each takes the shared lock plus its user's own. A write across all users (reloading
+    place data) takes the shared one exclusively, so it waits for, and blocks, all of them.
     """
-    conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": WRITE_LOCK})
-
-
-def recompute(conn: Connection) -> None:
-    resolve_places(conn)
-    resolve_times(conn)
-    regroup_trips(conn)
+    if user_id is None:
+        conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": WRITE_LOCK})
+        return
+    conn.execute(text("SELECT pg_advisory_xact_lock_shared(:key)"), {"key": WRITE_LOCK})
+    conn.execute(
+        text("SELECT pg_advisory_xact_lock(:key, hashtext(:user))"), {"key": WRITE_LOCK, "user": user_id}
+    )
 
 
 # 12 nautical miles: a country's territorial waters. A photo from a beach or a boat that
@@ -125,23 +129,29 @@ def resolve_places(conn: Connection) -> int:
     ).rowcount
 
 
-def all_photos() -> list[dict]:
+def all_photos(user_id: str) -> list[dict]:
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                f"SELECT {PHOTO_COLUMNS} FROM photos WHERE status = 'ready' "
+                f"SELECT {PHOTO_COLUMNS} FROM photos WHERE user_id = :user AND status = 'ready' "
                 "ORDER BY shot_at NULLS LAST, created_at"
-            )
+            ),
+            {"user": user_id},
         )
         return [dict(row._mapping) for row in rows]
 
 
-def get_photo(photo_id: str, include_exif: bool = False) -> dict | None:
+def get_photo(user_id: str | None, photo_id: str, include_exif: bool = False) -> dict | None:
+    """A ready photo of this user's (None only for internal callers that already know the
+    photo is theirs to read, like the worker)."""
     columns = PHOTO_COLUMNS + (", exif" if include_exif else "")
     with engine.connect() as conn:
         row = conn.execute(
-            text(f"SELECT {columns} FROM photos WHERE id = :id AND status = 'ready'"),
-            {"id": photo_id},
+            text(
+                f"SELECT {columns} FROM photos WHERE id = :id AND status = 'ready' "
+                "AND (CAST(:user AS uuid) IS NULL OR user_id = CAST(:user AS uuid))"
+            ),
+            {"id": photo_id, "user": user_id},
         ).first()
         return dict(row._mapping) if row else None
 
@@ -160,22 +170,24 @@ class UploadNotReceived(Exception):
 
 
 def create_pending(
-    original_filename: str | None, content_type: str, size_bytes: int, conn: Connection | None = None
+    user_id: str, original_filename: str | None, content_type: str, size_bytes: int,
+    conn: Connection | None = None,
 ) -> dict:
     if conn is None:
         with engine.begin() as own:
-            return create_pending(original_filename, content_type, size_bytes, own)
+            return create_pending(user_id, original_filename, content_type, size_bytes, own)
     row = conn.execute(
         text(
             """
             WITH new AS (SELECT gen_random_uuid() AS id)
-            INSERT INTO photos (id, original_filename, content_type, size_bytes, storage_key, status)
-            SELECT new.id, :filename, :content_type, :size, new.id::text || :ext, 'pending'
+            INSERT INTO photos (id, user_id, original_filename, content_type, size_bytes, storage_key, status)
+            SELECT new.id, :user, :filename, :content_type, :size, new.id::text || :ext, 'pending'
             FROM new
             RETURNING id, storage_key
             """
         ),
         {
+            "user": user_id,
             "filename": original_filename,
             "content_type": content_type,
             "size": size_bytes,
@@ -191,20 +203,22 @@ class DuplicatePhoto(Exception):
         self.original_id = original_id
 
 
-def find_by_hashes(hashes: list[str]) -> dict[str, str]:
-    """Map content hash -> id of the ready photo that already has it."""
+def find_by_hashes(user_id: str, hashes: list[str]) -> dict[str, str]:
+    """Map content hash -> id of this user's ready photo that already has it."""
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT content_sha256, id FROM photos WHERE content_sha256 = ANY(:hashes)"),
-            {"hashes": hashes},
+            text("SELECT content_sha256, id FROM photos WHERE user_id = :user AND content_sha256 = ANY(:hashes)"),
+            {"user": user_id, "hashes": hashes},
         )
         return {r.content_sha256: str(r.id) for r in rows}
 
 
-def _duplicate_of(conn: Connection, sha256: str, photo_id: str) -> str | None:
+def _duplicate_of(conn: Connection, user_id: str, sha256: str, photo_id: str) -> str | None:
+    """The same user's photo with these bytes. Another user's never counts: telling someone
+    "already imported" would reveal that a stranger has the photo."""
     found = conn.execute(
-        text("SELECT id FROM photos WHERE content_sha256 = :sha AND id != :id"),
-        {"sha": sha256, "id": photo_id},
+        text("SELECT id FROM photos WHERE user_id = :user AND content_sha256 = :sha AND id != :id"),
+        {"user": user_id, "sha": sha256, "id": photo_id},
     ).scalar_one_or_none()
     return str(found) if found else None
 
@@ -216,10 +230,10 @@ def _discard_upload(photo_id: str, storage_key: str) -> None:
     objects.delete(storage_key)
 
 
-def add_photo(original_filename: str | None, content_type: str, contents: bytes) -> dict:
+def add_photo(user_id: str, original_filename: str | None, content_type: str, contents: bytes) -> dict:
     """Upload through the API (M5 pass A), for scripts and tests. Unlike an import, it's
     processed before returning, trips included, rather than by the worker."""
-    pending = create_pending(original_filename, content_type, len(contents))
+    pending = create_pending(user_id, original_filename, content_type, len(contents))
     objects.put(pending["storage_key"], contents, content_type)
     return process_upload(pending["id"], contents, regroup_now=True)
 
@@ -268,14 +282,14 @@ def process_upload(photo_id: str, contents: bytes | None = None, regroup_now: bo
                 """
                 UPDATE photos SET status = 'processing'
                 WHERE id = :id AND status IN ('pending', 'uploaded', 'processing', 'failed')
-                RETURNING storage_key, size_bytes
+                RETURNING storage_key, size_bytes, user_id
                 """
             ),
             {"id": photo_id},
         ).first()
         if row is None:
             if conn.execute(text("SELECT 1 FROM photos WHERE id = :id"), {"id": photo_id}).first():
-                return get_photo(photo_id)  # already ready: a rerun changes nothing
+                return get_photo(None, photo_id)  # already ready: a rerun changes nothing
             raise UploadNotFound
     if contents is None:
         if objects.size(row.storage_key) != row.size_bytes:
@@ -283,8 +297,9 @@ def process_upload(photo_id: str, contents: bytes | None = None, regroup_now: bo
         contents = objects.get(row.storage_key)
     # The hash of the bytes actually stored, not the one the client declared.
     sha256 = hashlib.sha256(contents).hexdigest()
+    user_id = str(row.user_id)
     with engine.connect() as conn:
-        original = _duplicate_of(conn, sha256, photo_id)
+        original = _duplicate_of(conn, user_id, sha256, photo_id)
     if original:
         _discard_upload(photo_id, row.storage_key)
         raise DuplicatePhoto(original)
@@ -296,18 +311,18 @@ def process_upload(photo_id: str, contents: bytes | None = None, regroup_now: bo
         processed, error = None, f"{type(exc).__name__}: {exc}"
     process_ms = round((time.perf_counter() - started) * 1000)
     with engine.begin() as conn:
-        lock_writes(conn)
+        lock_writes(conn, user_id)
         status = conn.execute(
             text("SELECT status FROM photos WHERE id = :id"), {"id": photo_id}
         ).scalar_one_or_none()
         if status is None:
             raise UploadNotFound  # swept as an orphan while we were processing
         if status == "ready":
-            return get_photo(photo_id)  # a concurrent run finished first
+            return get_photo(None, photo_id)  # a concurrent run finished first
         # Re-check under the lock: an identical file may have completed while we processed.
-        original = _duplicate_of(conn, sha256, photo_id)
+        original = _duplicate_of(conn, user_id, sha256, photo_id)
         if original is None:
-            _store_processed(conn, photo_id, sha256, processed, error, process_ms, regroup_now)
+            _store_processed(conn, user_id, photo_id, sha256, processed, error, process_ms, regroup_now)
     if original:
         _discard_upload(photo_id, row.storage_key)
         raise DuplicatePhoto(original)
@@ -316,12 +331,12 @@ def process_upload(photo_id: str, contents: bytes | None = None, regroup_now: bo
         "photo ready id=%s bytes=%d process_ms=%d total_ms=%d error=%s",
         photo_id, len(contents), process_ms, total_ms, error,
     )
-    return get_photo(photo_id)
+    return get_photo(None, photo_id)
 
 
 def _store_processed(
-    conn: Connection, photo_id: str, sha256: str, processed, error: str | None, process_ms: int,
-    regroup_now: bool,
+    conn: Connection, user_id: str, photo_id: str, sha256: str, processed, error: str | None,
+    process_ms: int, regroup_now: bool,
 ) -> None:
     meta = processed.metadata if processed else None
     # Keys depend only on the id, so a retry overwrites rather than duplicates.
@@ -371,23 +386,26 @@ def _store_processed(
     # Place and time are cheap and per photo. Regrouping trips looks at every photo, so in
     # an import it waits for one coalesced job instead of running after each photo.
     resolve_places(conn)
-    resolve_times(conn)
+    resolve_times(conn, user_id)
     if regroup_now:
-        regroup_trips(conn)
+        regroup_trips(conn, user_id)
     else:
-        jobs.enqueue(conn, "regroup_trips", dedupe_key="all")
+        jobs.enqueue(conn, "regroup_trips", {"user_id": user_id}, dedupe_key=user_id)
 
 
-def resolve_times(conn: Connection) -> int:
+def resolve_times(conn: Connection, user_id: str) -> int:
+    """Work out times for all of one user's photos (a photo's zone can come from the
+    owner's other photos, never from someone else's)."""
     rows = conn.execute(
         text(
             """
             SELECT id, camera_make, camera_model, camera_serial, camera_time,
                    exif_offset_min, gps_time, lat, lon,
                    shot_at, tz_name, local_offset_min, time_source
-            FROM photos
+            FROM photos WHERE user_id = :user
             """
-        )
+        ),
+        {"user": user_id},
     ).all()
     offsets = [
         timeresolve.ClockOffset(
@@ -397,8 +415,9 @@ def resolve_times(conn: Connection) -> int:
         for o in conn.execute(
             text(
                 "SELECT camera_make, camera_model, camera_serial, offset_seconds, "
-                "valid_from, valid_to FROM camera_clock_offsets ORDER BY created_at"
-            )
+                "valid_from, valid_to FROM camera_clock_offsets WHERE user_id = :user ORDER BY created_at"
+            ),
+            {"user": user_id},
         )
     ]
     inputs = [
@@ -431,15 +450,18 @@ def resolve_times(conn: Connection) -> int:
     return len(changed)
 
 
-def regroup_trips(conn: Connection) -> None:
+def regroup_trips(conn: Connection, user_id: str) -> None:
+    """Regroup one user's photos into trips."""
     rows = conn.execute(
         text(
             """
             SELECT p.id, p.shot_at, p.lat, p.lon, p.trip_id,
                    p.trip_pinned OR coalesce(t.is_locked, false) AS pinned
             FROM photos p LEFT JOIN trips t ON t.id = p.trip_id
+            WHERE p.user_id = :user
             """
-        )
+        ),
+        {"user": user_id},
     ).all()
     locked = [
         trips.LockedTrip(str(r.id), r.start, r.end)
@@ -448,15 +470,16 @@ def regroup_trips(conn: Connection) -> None:
                 """
                 SELECT t.id, min(p.shot_at) AS start, max(p.shot_at) AS end
                 FROM trips t JOIN photos p ON p.trip_id = t.id
-                WHERE t.is_locked AND p.shot_at IS NOT NULL
+                WHERE t.user_id = :user AND t.is_locked AND p.shot_at IS NOT NULL
                 GROUP BY t.id
                 """
-            )
+            ),
+            {"user": user_id},
         )
     ]
     homes = [
         trips.Home(r.lat, r.lon, r.radius_km)
-        for r in conn.execute(text("SELECT lat, lon, radius_km FROM homes"))
+        for r in conn.execute(text("SELECT lat, lon, radius_km FROM homes WHERE user_id = :user"), {"user": user_id})
     ]
     grouping = trips.group_photos(
         (
@@ -471,7 +494,7 @@ def regroup_trips(conn: Connection) -> None:
     )
 
     new_ids = {
-        ref: str(conn.execute(text("INSERT INTO trips DEFAULT VALUES RETURNING id")).scalar_one())
+        ref: str(conn.execute(text("INSERT INTO trips (user_id) VALUES (:user) RETURNING id"), {"user": user_id}).scalar_one())
         for ref in grouping.new_trips
     }
     current = {str(r.id): (str(r.trip_id) if r.trip_id else None) for r in rows}
@@ -483,11 +506,15 @@ def regroup_trips(conn: Connection) -> None:
     if changes:
         conn.execute(text("UPDATE photos SET trip_id = :trip_id WHERE id = :id"), changes)
     conn.execute(
-        text("DELETE FROM trips t WHERE NOT EXISTS (SELECT 1 FROM photos p WHERE p.trip_id = t.id)")
+        text(
+            "DELETE FROM trips t WHERE t.user_id = :user "
+            "AND NOT EXISTS (SELECT 1 FROM photos p WHERE p.trip_id = t.id)"
+        ),
+        {"user": user_id},
     )
 
 
-def list_cameras() -> list[dict]:
+def list_cameras(user_id: str) -> list[dict]:
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -495,18 +522,25 @@ def list_cameras() -> list[dict]:
                 SELECT camera_make, camera_model, camera_serial, count(*) AS photo_count,
                        min(camera_time) AS first_camera_time, max(camera_time) AS last_camera_time
                 FROM photos
-                WHERE camera_make IS NOT NULL AND camera_model IS NOT NULL
+                WHERE user_id = :user AND camera_make IS NOT NULL AND camera_model IS NOT NULL
                 GROUP BY camera_make, camera_model, camera_serial
                 ORDER BY photo_count DESC
                 """
-            )
+            ),
+            {"user": user_id},
         )
         return [dict(r._mapping) for r in rows]
 
 
-def list_offsets() -> list[dict]:
+OFFSET_COLUMNS = "id, camera_make, camera_model, camera_serial, offset_seconds, valid_from, valid_to, note, created_at"
+
+
+def list_offsets(user_id: str) -> list[dict]:
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT * FROM camera_clock_offsets ORDER BY created_at"))
+        rows = conn.execute(
+            text(f"SELECT {OFFSET_COLUMNS} FROM camera_clock_offsets WHERE user_id = :user ORDER BY created_at"),
+            {"user": user_id},
+        )
         return [dict(r._mapping) for r in rows]
 
 
@@ -514,13 +548,14 @@ class OffsetOverlapError(Exception):
     pass
 
 
-def add_offset(values: dict, replace_overlapping: bool = False) -> dict:
+def add_offset(user_id: str, values: dict, replace_overlapping: bool = False) -> dict:
     """Add a clock offset. With replace_overlapping, the camera's offsets covering any of the
     same camera-clock times are deleted first, in the same transaction: either the new
     offset replaces them, or (if anything fails) they're all still there."""
     try:
+        values = {**values, "user": user_id}
         with engine.begin() as conn:
-            lock_writes(conn)
+            lock_writes(conn, user_id)
             replaced = 0
             if replace_overlapping:
                 # The same test as the exclusion constraint, so exactly the rows that would
@@ -529,7 +564,8 @@ def add_offset(values: dict, replace_overlapping: bool = False) -> dict:
                     text(
                         """
                         DELETE FROM camera_clock_offsets
-                        WHERE camera_make = :camera_make AND camera_model = :camera_model
+                        WHERE user_id = :user
+                          AND camera_make = :camera_make AND camera_model = :camera_model
                           AND coalesce(camera_serial, '')
                               = coalesce(CAST(:camera_serial AS text), '')
                           AND tsrange(valid_from, valid_to) && tsrange(
@@ -540,19 +576,19 @@ def add_offset(values: dict, replace_overlapping: bool = False) -> dict:
                 ).rowcount
             row = conn.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO camera_clock_offsets
-                        (camera_make, camera_model, camera_serial, offset_seconds,
+                        (user_id, camera_make, camera_model, camera_serial, offset_seconds,
                          valid_from, valid_to, note)
-                    VALUES (:camera_make, :camera_model, :camera_serial, :offset_seconds,
+                    VALUES (:user, :camera_make, :camera_model, :camera_serial, :offset_seconds,
                             :valid_from, :valid_to, :note)
-                    RETURNING *
+                    RETURNING {OFFSET_COLUMNS}
                     """
                 ),
                 values,
             ).one()
-            changed = resolve_times(conn)
-            regroup_trips(conn)
+            changed = resolve_times(conn, user_id)
+            regroup_trips(conn, user_id)
     except IntegrityError as exc:
         if isinstance(exc.orig, psycopg.errors.ExclusionViolation):
             raise OffsetOverlapError from exc
@@ -560,14 +596,15 @@ def add_offset(values: dict, replace_overlapping: bool = False) -> dict:
     return {**dict(row._mapping), "photos_updated": changed, "replaced": replaced}
 
 
-def delete_offset(offset_id: str) -> int | None:
+def delete_offset(user_id: str, offset_id: str) -> int | None:
     with engine.begin() as conn:
-        lock_writes(conn)
+        lock_writes(conn, user_id)
         deleted = conn.execute(
-            text("DELETE FROM camera_clock_offsets WHERE id = :id"), {"id": offset_id}
+            text("DELETE FROM camera_clock_offsets WHERE id = :id AND user_id = :user"),
+            {"id": offset_id, "user": user_id},
         ).rowcount
         if not deleted:
             return None
-        changed = resolve_times(conn)
-        regroup_trips(conn)
+        changed = resolve_times(conn, user_id)
+        regroup_trips(conn, user_id)
         return changed

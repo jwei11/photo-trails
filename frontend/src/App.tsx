@@ -1,12 +1,26 @@
-import { Link, NavLink, Route, Routes } from 'react-router'
+import { Link, Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router'
 import TripMapPage from './map/TripMapPage.tsx'
 import styles from './App.module.css'
+import LoginPage from './auth/LoginPage.tsx'
+import { signOut, useMe } from './auth/session.ts'
 import ImportPage from './imports/ImportPage.tsx'
 import { useImport } from './imports/useImport.ts'
 import SettingsPage from './settings/SettingsPage.tsx'
 import TimelinePage from './TimelinePage.tsx'
 
 export default function App() {
+  const { data: me, isPending, isError } = useMe()
+  const { pathname } = useLocation()
+  if (isPending) return null
+  if (isError) return <p className={styles.page}>Couldn't reach the server. Reload to try again.</p>
+  // Signed out: the login page, whatever the URL.
+  if (!me.user) {
+    return (
+      <div className={styles.page}>
+        {pathname === '/login' ? <LoginPage /> : <Navigate to="/login" replace />}
+      </div>
+    )
+  }
   return (
     <div className={styles.page}>
       <header className={styles.header}>
@@ -16,10 +30,12 @@ export default function App() {
           <NavLink to="/import">Import</NavLink>
           <NavLink to="/settings">Settings</NavLink>
           <ImportIndicator />
+          <SignOut email={me.user.email} />
         </nav>
       </header>
       <main>
         <Routes>
+          <Route path="/login" element={<Navigate to="/" replace />} />
           <Route path="/" element={<TimelinePage />} />
           <Route path="/trips/:tripId" element={<TripMapPage />} />
           <Route path="/import" element={<ImportPage />} />
@@ -41,5 +57,20 @@ function ImportIndicator() {
       : `Processing ${finished}/${items.length}`
   return (
     <Link to="/import" className={styles.indicator} aria-live="polite">{label}</Link>
+  )
+}
+
+function SignOut({ email }: { email: string }) {
+  const navigate = useNavigate()
+  return (
+    <span className={styles.account}>
+      {email}
+      <button
+        className={styles.signOut}
+        onClick={async () => { await signOut(); navigate('/login', { replace: true }) }}
+      >
+        Sign out
+      </button>
+    </span>
   )
 }

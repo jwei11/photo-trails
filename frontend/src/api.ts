@@ -1,3 +1,5 @@
+import { queryClient } from './queryClient.ts'
+
 // Types mirror what the FastAPI endpoints return. Timestamps arrive as ISO strings.
 
 export type Photo = {
@@ -67,6 +69,9 @@ export class ApiError extends Error {
 // Every API call goes through here, so paths are written without the /api prefix.
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, options)
+  // The session ended (expired, or signed out in another tab): recheck who's signed in,
+  // which shows the login page.
+  if (res.status === 401) void queryClient.invalidateQueries({ queryKey: ['me'] })
   if (!res.ok) throw new ApiError(res.status, errorMessage(res.status, await res.text()))
   return (res.status === 204 ? null : await res.json()) as T
 }

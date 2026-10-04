@@ -28,23 +28,27 @@ class InvalidItemState(Exception):
     pass
 
 
-def create_import(files: list[dict]) -> dict:
+def create_import(user_id: str, files: list[dict]) -> dict:
     """Register a batch. Files already stored come back as duplicates and need no upload.
 
     The same file twice within one batch is uploaded twice and resolved when the second one
     completes. The browser drops such repeats before sending; marking them duplicates up front
     would claim a photo exists before the first copy has actually arrived.
     """
-    existing = storage.find_by_hashes(sorted({f["sha256"] for f in files}))
+    existing = storage.find_by_hashes(user_id, sorted({f["sha256"] for f in files}))
 
     with engine.begin() as conn:
-        import_id = str(conn.execute(text("INSERT INTO imports DEFAULT VALUES RETURNING id")).scalar_one())
+        import_id = str(
+            conn.execute(
+                text("INSERT INTO imports (user_id) VALUES (:user) RETURNING id"), {"user": user_id}
+            ).scalar_one()
+        )
         for position, f in enumerate(files):
             sha = f["sha256"]
             if sha in existing:
                 status, photo_id = "duplicate", existing[sha]
             else:
-                pending = storage.create_pending(f["filename"], f["content_type"], f["size_bytes"], conn)
+                pending = storage.create_pending(user_id, f["filename"], f["content_type"], f["size_bytes"], conn)
                 status, photo_id = "uploading", pending["id"]
             conn.execute(
                 text(
@@ -61,17 +65,18 @@ def create_import(files: list[dict]) -> dict:
                     "status": status, "photo_id": photo_id,
                 },
             )
-    result = get_import(import_id)
+    result = get_import(user_id, import_id)
     uploading = [item for item in result["items"] if item["status"] == "uploading"]
     for item, url in zip(uploading, _signed_upload_urls(uploading)):
         item["upload_url"] = url
     return result
 
 
-def get_import(import_id: str) -> dict:
+def get_import(user_id: str, import_id: str) -> dict:
     with engine.connect() as conn:
         created = conn.execute(
-            text("SELECT created_at FROM imports WHERE id = :id"), {"id": import_id}
+            text("SELECT created_at FROM imports WHERE id = :id AND user_id = :user"),
+            {"id": import_id, "user": user_id},
         ).scalar_one_or_none()
         if created is None:
             raise ImportNotFound
@@ -85,7 +90,7 @@ def get_import(import_id: str) -> dict:
     return {"id": import_id, "created_at": created, "counts": _counts(items), "items": items}
 
 
-def list_imports(limit: int = 20) -> list[dict]:
+def list_imports(user_id: str, limit: int = 20) -> list[dict]:
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -97,10 +102,11 @@ def list_imports(limit: int = 20) -> list[dict]:
                        count(*) FILTER (WHERE it.status = 'duplicate') AS duplicate,
                        count(*) FILTER (WHERE it.status = 'failed') AS failed
                 FROM imports i JOIN import_items it ON it.import_id = i.id
+                WHERE i.user_id = :user
                 GROUP BY i.id ORDER BY i.created_at DESC LIMIT :limit
                 """
             ),
-            {"limit": limit},
+            {"user": user_id, "limit": limit},
         )
         return [
             {
@@ -114,10 +120,10 @@ def list_imports(limit: int = 20) -> list[dict]:
         ]
 
 
-def renew_upload_url(import_id: str, item_id: str) -> dict:
+def renew_upload_url(user_id: str, import_id: str, item_id: str) -> dict:
     """A fresh upload URL, for retrying a failed upload or after the first one expired."""
     with engine.begin() as conn:
-        item = _get_item(conn, import_id, item_id, for_update=True)
+        item = _get_item(conn, user_id, import_id, item_id, for_update=True)
         if item["status"] in ("done", "duplicate"):
             raise InvalidItemState("This file is already imported.")
         if item["status"] == "processing":
@@ -130,25 +136,25 @@ def renew_upload_url(import_id: str, item_id: str) -> dict:
         if photo_status == "ready":
             # Completion finished but the item wasn't updated (e.g. a crash in between).
             _set_status(conn, item_id, "done", photo_id=item["photo_id"])
-            return _get_item(conn, import_id, item_id)
+            return _get_item(conn, user_id, import_id, item_id)
         if photo_status in ("uploaded", "processing"):
             _set_status(conn, item_id, "processing", photo_id=item["photo_id"])
-            return _get_item(conn, import_id, item_id)
+            return _get_item(conn, user_id, import_id, item_id)
         if photo_status != "pending":  # swept as abandoned; start a new pending photo
             item["photo_id"] = storage.create_pending(
-                item["filename"], item["content_type"], item["size_bytes"], conn
+                user_id, item["filename"], item["content_type"], item["size_bytes"], conn
             )["id"]
         _set_status(conn, item_id, "uploading", photo_id=item["photo_id"])
-    item = get_item(import_id, item_id)
+    item = get_item(user_id, import_id, item_id)
     item["upload_url"] = _signed_upload_urls([item])[0]
     return item
 
 
-def complete_item(import_id: str, item_id: str) -> dict:
+def complete_item(user_id: str, import_id: str, item_id: str) -> dict:
     """The file's upload finished: queue it for processing and return at once. Safe to call
     again, including to retry a processing failure."""
     with engine.begin() as conn:
-        item = _get_item(conn, import_id, item_id, for_update=True)
+        item = _get_item(conn, user_id, import_id, item_id, for_update=True)
         if item["status"] in ("done", "duplicate", "processing"):
             return item
         if item["photo_id"] is None:
@@ -165,7 +171,7 @@ def complete_item(import_id: str, item_id: str) -> dict:
                             item["photo_id"])
             except storage.UploadNotFound:
                 _set_status(conn, item_id, "failed", "upload", "The upload expired. Upload the file again.")
-    return get_item(import_id, item_id)
+    return get_item(user_id, import_id, item_id)
 
 
 def record_outcome(
@@ -187,26 +193,27 @@ def record_outcome(
         )
 
 
-def report_upload_failure(import_id: str, item_id: str, error: str) -> dict:
+def report_upload_failure(user_id: str, import_id: str, item_id: str, error: str) -> dict:
     with engine.begin() as conn:
-        item = _get_item(conn, import_id, item_id, for_update=True)
+        item = _get_item(conn, user_id, import_id, item_id, for_update=True)
         if item["status"] == "uploading":
             _set_status(conn, item_id, "failed", "upload", error, item["photo_id"])
-    return get_item(import_id, item_id)
+    return get_item(user_id, import_id, item_id)
 
 
-def get_item(import_id: str, item_id: str) -> dict:
+def get_item(user_id: str, import_id: str, item_id: str) -> dict:
     with engine.connect() as conn:
-        return _get_item(conn, import_id, item_id)
+        return _get_item(conn, user_id, import_id, item_id)
 
 
-def _get_item(conn: Connection, import_id: str, item_id: str, for_update: bool = False) -> dict:
+def _get_item(conn: Connection, user_id: str, import_id: str, item_id: str, for_update: bool = False) -> dict:
     row = conn.execute(
         text(
-            f"SELECT {ITEM_COLUMNS} FROM import_items WHERE id = :item AND import_id = :import"
+            f"SELECT {ITEM_COLUMNS} FROM import_items WHERE id = :item AND import_id = :import "
+            "AND import_id IN (SELECT id FROM imports WHERE user_id = :user)"
             + (" FOR UPDATE" if for_update else "")
         ),
-        {"item": item_id, "import": import_id},
+        {"item": item_id, "import": import_id, "user": user_id},
     ).first()
     if row is None:
         raise ImportNotFound
