@@ -1,0 +1,109 @@
+# Production: the stack on the server. Copied to /opt/trip-mapper with a .env made from
+# deploy/.env.example (see docs/deploy.md). Differences from the development compose.yaml:
+# - The app is the image CI published, at an exact commit (APP_IMAGE), never built here.
+# - Caddy is the only thing reachable from outside: ports 80 and 443, with a certificate
+#   from Let's Encrypt. The API and database aren't published at all.
+# - Photos go to Amazon S3, so there's no SeaweedFS.
+# - Everything comes back after a crash or a reboot (restart: unless-stopped).
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?set it in .env}:${POSTGRES_PASSWORD:?set it in .env}@db:5432/${POSTGRES_DB:?set it in .env}
+  DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-UTC}
+  S3_REGION: ${S3_REGION:?set it in .env}
+  S3_BUCKET: ${S3_BUCKET:?set it in .env}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set it in .env}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?set it in .env}
+  # The site's own address: allowed origin for changes, sign-in links, and Google's redirect.
+  APP_ORIGINS: https://${DOMAIN:?set it in .env}
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+
+x-app: &app
+  image: ${APP_IMAGE:?set it in .env, e.g. ghcr.io/jwei11/photo-trails:<commit sha>}
+  environment: *app-env
+  restart: unless-stopped
+
+services:
+  caddy:
+    image: caddy:2.10@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data  # the certificates: keep them, or every restart asks Let's Encrypt again
+      - caddy-config:/config
+    depends_on:
+      api: {condition: service_healthy}
+
+  # The official PostGIS image. Development builds its own only because this one has no
+  # arm64 build for Apple Silicon; the server is amd64. Same Postgres 17 + PostGIS 3.
+  db:
+    image: postgis/postgis:17-3.5@sha256:01a6a70e41e6c4467c8f55f6063555ed72db2d6662cd0d571040d42eadaeb6f6
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck: {disable: true}
+
+  geodata:
+    <<: *app
+    restart: "no"
+    command: ["python", "-m", "app.geodata", "load", "--if-empty"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    volumes:
+      - geodata:/app/data/geo
+    healthcheck: {disable: true}
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      # Uvicorn takes the scheme and client address from X-Forwarded-* headers only from
+      # proxies it trusts. Caddy is a different container, so trust any: the API's port
+      # isn't published, so Caddy is the only thing that can reach it.
+      FORWARDED_ALLOW_IPS: "*"
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *app-env
+      WORKER_HEARTBEAT_FILE: /tmp/worker-heartbeat
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/worker-heartbeat') > 60)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 30s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+volumes:
+  pgdata:
+  geodata:
+  caddy-data:
+  caddy-config:

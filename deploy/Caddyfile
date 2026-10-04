@@ -1,0 +1,22 @@
+# Caddy gets and renews the HTTPS certificate for DOMAIN by itself (Let's Encrypt), and
+# redirects http:// to https://.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy api:8000
+
+	header {
+		# Browsers only ever use HTTPS for this site from now on (one year).
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		# Not shown inside other sites' frames (clickjacking).
+		X-Frame-Options "DENY"
+		# Send only the origin, never the path (which can hold a share token), to other sites.
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

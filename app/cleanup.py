@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from app import objects
+from app import backup, objects
 from app.db import engine
 
 log = logging.getLogger(__name__)
@@ -48,9 +48,11 @@ def sweep(max_age: timedelta = DEFAULT_MAX_AGE, dry_run: bool = False) -> dict:
         }
 
     pending_keys = [k for r in stale for k in (r.storage_key, f"{r.id}_thumb.webp", f"{r.id}_web.webp")]
+    # Database backups share the bucket but aren't photos: never orphans.
     unreferenced = [
         key for key, modified in objects.list_keys()
         if key not in referenced and key not in pending_keys and modified < cutoff
+        and not key.startswith(backup.PREFIX)
     ]
     if not dry_run:
         objects.delete(*pending_keys, *unreferenced)
