@@ -41,6 +41,15 @@ browser ──HTTPS──▶ Caddy :443 ──▶ api ──▶ db (Postgres + P
   server's own firewall (ufw), so this cloud firewall is the one that counts.
 - DuckDNS: set the subdomain's IP to the droplet's public IPv4.
 
+What went wrong the first time, so it doesn't again:
+- The firewall needs the HTTP rule (port 80) too. Without it HTTPS still works (Caddy
+  proves the domain over port 443), but `http://` addresses just time out.
+- The server's `.env` must have the **prod** IAM user's keys. With the dev user's, the API
+  refuses to start ("Can't reach bucket ... credentials are wrong"). To see whose keys
+  they are: `docker compose run --rm --no-deps -T api python -c "import boto3; from app
+  import config as c; print(boto3.client('sts', aws_access_key_id=c.S3_ACCESS_KEY,
+  aws_secret_access_key=c.S3_SECRET_KEY).get_caller_identity()['Arn'])"`.
+
 ## 3. On the server
 
 ```bash
