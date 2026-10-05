@@ -88,7 +88,9 @@ services:
 
   worker:
     <<: *app
-    command: ["python", "-m", "app.worker"]
+    # Two photos at a time, not four: decoding a large photo takes a few hundred MB, and
+    # the droplet has 1 GB. Big imports take longer; nothing else changes.
+    command: ["python", "-m", "app.worker", "--threads", "2"]
     environment:
       <<: *app-env
       WORKER_HEARTBEAT_FILE: /tmp/worker-heartbeat

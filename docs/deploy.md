@@ -15,7 +15,7 @@ browser ──HTTPS──▶ Caddy :443 ──▶ api ──▶ db (Postgres + P
 
 1. **DigitalOcean account.** If you have the GitHub Student Developer Pack, claim its
    DigitalOcean credit first. Then, before creating anything: Settings → Billing →
-   **Billing alerts**, alert at $15 (the droplet is $12/month).
+   **Billing alerts**, alert at $10 (the droplet is $6/month).
 2. **DuckDNS name.** At duckdns.org, sign in with GitHub and add a subdomain, e.g.
    `tripmapper-jw`. That's `DOMAIN=tripmapper-jw.duckdns.org`. Leave the IP for now.
 3. **Production S3 bucket** (AWS console, us-east-2), like the dev one but separate:
@@ -33,7 +33,7 @@ browser ──HTTPS──▶ Caddy :443 ──▶ api ──▶ db (Postgres + P
 
 ## 2. The droplet
 
-- Create droplet: Ubuntu 24.04 LTS, Basic, Regular, **2 GB / 1 vCPU ($12)**, region
+- Create droplet: Ubuntu 24.04 LTS, Basic, Regular, **1 GB / 1 vCPU ($6)**, region
   **NYC** (close to the bucket in us-east-2: the worker downloads every original), SSH key
   authentication with the key above (no password), monitoring on. Name `trip-mapper-1`.
 - Networking → Firewalls → create `trip-mapper`: inbound TCP 22, 80, 443 and UDP 443
@@ -47,7 +47,7 @@ browser ──HTTPS──▶ Caddy :443 ──▶ api ──▶ db (Postgres + P
 ssh root@<ip>
 # Updates, and security updates from now on (on by default in Ubuntu; check it's there).
 apt-get update && apt-get -y upgrade && apt-get -y install unattended-upgrades
-# 2 GB of swap: loading place data briefly needs more memory than the droplet has.
+# 2 GB of swap: the droplet has 1 GB, and loading place data briefly needs more.
 fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
 echo '/swapfile none swap sw 0 0' >> /etc/fstab
 # Docker, from Docker's own repository (Ubuntu's is older).
