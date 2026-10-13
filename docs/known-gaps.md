@@ -1,0 +1,40 @@
+# Known gaps
+
+- Backups are in the same bucket, written with the same credentials as the app. Someone who takes over the app could delete them too, and there's no copy outside this AWS account. A separate backup user that can only add objects, with versioning on the bucket, would fix both.
+- Production is one server: if the droplet is down, so is the site. Postgres on it means a restore loses up to a day of changes (nightly backups).
+- The server is administered as root over SSH (keys only). A deploy user with limited sudo would be better.
+- M10 isn't done until the stack has been started from a fresh clone on someone else's laptop. So far it has only run on my own Mac (arm64): the amd64 build, which is what an Intel laptop or a CI runner would make, hasn't been tried.
+- The image is 592 MB (154 MB compressed), mostly numpy, Pillow, pillow-heif, and boto3. Nothing has been done to trim it.
+- The first start needs internet access for the place data. Offline, `geodata` fails and photos have no place names until it's run again.
+- A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
+- M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
+- The worker downloads each original into memory to process it (as `complete` did before M8). Fine for photos up to the 200 MB limit, but four threads processing large files at once need several hundred MB.
+- There are no upload quotas: an invited user can upload as much as they like. The 200 MB per-file cap limits a single file, not the total.
+- A revoked share stops working at once, but an image URL it already handed out keeps working until it expires (up to an hour: presigned URLs are signed for an hour).
+- A share still shows times of day and place names, which together can hint at routines. Day numbers keep exact dates out, but not the season.
+- Share views aren't rate-limited. Guessing a 192-bit token isn't feasible, but nothing slows down a script that tries.
+- Sessions last 30 days and there's no "sign out everywhere" or list of active sessions yet; deleting a user's rows from `sessions` does it.
+- `POST /api/photos` rejects files over 200 MB before reading them into memory, but the web framework has already saved the whole request to a temporary file on disk by then, so a huge upload still costs disk space. Presigned uploads don't have this problem, since the file never reaches the API.
+- Uploads are limited to `image/*` (except SVG, which can contain script) and `application/octet-stream`, because the stored type is served back to browsers. Photos uploaded before this rule keep whatever type they were given.
+- The browser reads each file fully into memory to hash it (Web Crypto has no streaming hash). Fine for photos, but a 200 MB file briefly costs 200 MB of browser memory. Hashing also needs a secure context (HTTPS or localhost).
+- Import items that are never uploaded stay `uploading` forever (their pending photo is swept after an hour). The import history shows them as "not uploaded", and they can be resumed by picking the files again.
+- SeaweedFS allows cross-origin requests from any site by default, while real S3 denies them unless the bucket's CORS rule allows the origin. The app sets an explicit rule on SeaweedFS too, but the permissive default means offline development and tests can't catch a mistake in it. The S3 bucket's rule is set by hand in the console until M12 moves it to Terraform, so it can drift from `APP_ORIGINS`.
+- RAW files and video aren't decoded: they're stored, with no metadata or previews.
+- A wall-clock time in the repeated hour when clocks fall back is ambiguous. We take the first occurrence. Only a recorded offset or GPS time can disambiguate it.
+- Some cameras write a stale GPS timestamp (from the last fix, not the shot), so `gps` is trusted below the recorded offset.
+- Neighbour matching doesn't know about trips. A no-GPS photo can borrow a zone from a photo on a different trip if one is within 48 hours. Scoping it would create a circular dependency (trips need times, which need zones, which would need trips), so it's left as is.
+- Trips can't be unlocked, so a locked trip never benefits from later algorithm improvements. An "unlock" action would fix this.
+- Home suggestions need photos taken at home on at least 5 days over 2 weeks. Someone who rarely takes photos at home gets no suggestion, and their shares are only as safe as the homes they set by hand.
+- Photos without GPS have no place, even when a phone photo minutes later does. Times already borrow a zone from a nearby located photo; places could borrow the same way, but a guess would need marking as one, like a guessed zone.
+- Place names come from GeoNames' primary name, usually the local one ("Lisboa" would be ideal for some, "Lisbon" for others). Its alternate names include translations, but they aren't loaded.
+- Map tiles come from OpenStreetMap's servers, whose usage policy doesn't cover production traffic. Deploying (M12) needs a tile provider; it's the `TILES` URL in `frontend/src/map/TripMap.tsx`.
+- The route draws straight lines between photos, so its distance is a lower bound for a winding road and too high for noisy GPS: photos jumping back and forth add distance never travelled. A GPX track (the planned follow-up) gives the real path.
+- No GPX import yet, so photos without GPS (the Fujifilm's) aren't on the map, even when their time puts them between two located photos.
+- Elevation is shown only when photos carry GPS altitude, and climb counts only rises between photos (5 m or more), so it's a lower bound.
+- The place data is a snapshot: `python -m app.geodata load` refreshes it and re-matches every photo, but nothing schedules that.
+- A photo far out at sea gets its nearest place however distant (stored with its distance), and no country.
+- The grouping thresholds (48h, 300 km / 24h, 3 photos, 25 km) are constants, not settings.
+- The timeline page only merges a trip with the next one. The API merges any set of trips.
+- Trip bounding boxes don't handle the antimeridian: a trip across the Pacific date line (e.g. Fiji) gets a box spanning the whole globe.
+- Regrouping is O(n) per write across all photos. Trips have the same scaling note as time resolution.
+- Clock offsets match the camera exactly on make, model, and serial. The same model without a serial number is treated as a different camera.
