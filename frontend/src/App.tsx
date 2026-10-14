@@ -1,8 +1,9 @@
+import { useState } from 'react'
 import { Link, Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router'
 import TripMapPage from './map/TripMapPage.tsx'
 import styles from './App.module.css'
 import LoginPage from './auth/LoginPage.tsx'
-import { signOut, useMe } from './auth/session.ts'
+import { signOut, useMe, type User } from './auth/session.ts'
 import SharedTripPage from './shared/SharedTripPage.tsx'
 import ImportPage from './imports/ImportPage.tsx'
 import { useImport } from './imports/useImport.ts'
@@ -42,7 +43,7 @@ export default function App() {
           <NavLink to="/import">Import</NavLink>
           <NavLink to="/settings">Settings</NavLink>
           <ImportIndicator />
-          <SignOut email={me.user.email} />
+          <SignOut user={me.user} />
         </nav>
       </header>
       <main>
@@ -72,17 +73,28 @@ function ImportIndicator() {
   )
 }
 
-function SignOut({ email }: { email: string }) {
+function SignOut({ user }: { user: User }) {
   const navigate = useNavigate()
+  const guest = user.kind === 'guest'
   return (
     <span className={styles.account}>
-      {email}
+      {guest ? <DemoNotice expiresAt={user.expires_at} /> : user.email}
       <button
         className={styles.signOut}
         onClick={async () => { await signOut(); navigate('/login', { replace: true }) }}
       >
-        Sign out
+        {guest ? 'End demo' : 'Sign out'}
       </button>
     </span>
   )
+}
+
+// A guest's account, and everything in it, is deleted when it expires.
+function DemoNotice({ expiresAt }: { expiresAt: string | null }) {
+  // Read once, when the notice first shows: an hour count needn't tick.
+  const [now] = useState(() => Date.now())
+  const hours = expiresAt ? Math.max(1, Math.round((Date.parse(expiresAt) - now) / 3_600_000)) : null
+  return <span title="Everything in this demo account is deleted when it ends.">
+    Demo account{hours !== null && `, deleted in ${hours} h`}
+  </span>
 }

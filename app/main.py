@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, imports, objects, shares, storage, trip_store
+from app import auth, guests, imports, limits, objects, shares, storage, trip_store
 from app.config import APP_ORIGINS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -62,11 +62,39 @@ CurrentUser = Annotated[auth.User, Depends(auth.current_user)]
 
 # ---- Signing in ----------------------------------------------------------------------
 
+def _user_json(user: auth.User) -> dict:
+    return {"id": user.id, "email": user.email, "kind": user.kind, "expires_at": user.expires_at}
+
+
 @api.get("/auth/me")
 def me(request: Request):
-    """Who's signed in (null if nobody), and which sign-in methods this server offers."""
+    """Who's signed in (null if nobody), and what this server offers: sign-in with Google,
+    whether Google sign-in creates new accounts right now, and the demo."""
     user = auth.user_for_session(request.cookies.get(auth.SESSION_COOKIE))
-    return {"user": user and {"id": user.id, "email": user.email}, "google": auth.google_enabled()}
+    google = auth.google_enabled()
+    return {
+        "user": user and _user_json(user),
+        "google": google,
+        "signup": google and auth.signups_open(),
+        "demo": guests.demo_available(),
+    }
+
+
+@api.post("/auth/guest")
+def start_demo(request: Request, response: Response):
+    """Try the demo: a new guest account with a copy of the demo trip, signed in at once."""
+    try:
+        user = guests.start(request.client.host if request.client else "unknown")
+    except guests.DemoUnavailable:
+        raise HTTPException(status_code=404, detail="There's no demo on this server.")
+    except guests.DemoFull:
+        raise HTTPException(status_code=503, detail="The demo is full right now. Try again in a few hours.")
+    except guests.TooManyFromHere:
+        raise HTTPException(status_code=429, detail="You've started several demos today. Try again tomorrow.")
+    auth.set_session_cookie(response, request, auth.create_session(user.id))
+    # Where to start: the demo trip's map, the most telling page.
+    trips = trip_store.list_trips(user.id)
+    return {"user": _user_json(user), "trip_id": trips[0]["id"] if trips else None}
 
 
 @api.get("/auth/google/start")
@@ -115,7 +143,7 @@ def sign_in_with_link(body: LoginLink, request: Request, response: Response):
     if user is None:
         raise HTTPException(status_code=400, detail="This sign-in link has expired or was already used.")
     auth.set_session_cookie(response, request, auth.create_session(user.id))
-    return {"user": {"id": user.id, "email": user.email}}
+    return {"user": _user_json(user)}
 
 
 @api.post("/auth/logout", status_code=204)
@@ -152,7 +180,9 @@ async def upload_photo(file: UploadFile, user: CurrentUser):
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File is larger than 200 MB")
     try:
-        return await run_in_threadpool(storage.add_photo, user.id, file.filename, content_type, contents)
+        return await run_in_threadpool(storage.add_photo, user.id, file.filename, content_type, contents, user.kind)
+    except limits.QuotaExceeded as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except storage.DuplicatePhoto as dup:
         raise HTTPException(
             status_code=409,
@@ -192,7 +222,10 @@ def _import_errors(fn, *args):
 @api.post("/imports", status_code=201)
 def create_import(body: ImportRequest, user: CurrentUser):
     """Register a batch; returns a signed upload URL for each file not already stored."""
-    return imports.create_import(user.id, [f.model_dump() for f in body.files])
+    try:
+        return imports.create_import(user.id, [f.model_dump() for f in body.files], user.kind)
+    except limits.QuotaExceeded as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @api.get("/imports")

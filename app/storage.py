@@ -9,7 +9,7 @@ import psycopg
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from app import images, jobs, objects, timeresolve, trips, tz
+from app import images, jobs, limits, objects, timeresolve, trips, tz
 from app.config import DEFAULT_TIMEZONE
 from app.db import engine
 
@@ -230,10 +230,16 @@ def _discard_upload(photo_id: str, storage_key: str) -> None:
     objects.delete(storage_key)
 
 
-def add_photo(user_id: str, original_filename: str | None, content_type: str, contents: bytes) -> dict:
+def add_photo(
+    user_id: str, original_filename: str | None, content_type: str, contents: bytes, kind: str = "invited",
+) -> dict:
     """Upload through the API (M5 pass A), for scripts and tests. Unlike an import, it's
-    processed before returning, trips included, rather than by the worker."""
-    pending = create_pending(user_id, original_filename, content_type, len(contents))
+    processed before returning, trips included, rather than by the worker. `kind` is the
+    account's, for its quota."""
+    with engine.begin() as conn:
+        lock_writes(conn, user_id)
+        limits.check_upload(conn, user_id, kind, [len(contents)])
+        pending = create_pending(user_id, original_filename, content_type, len(contents), conn)
     objects.put(pending["storage_key"], contents, content_type)
     return process_upload(pending["id"], contents, regroup_now=True)
 
@@ -242,7 +248,7 @@ def mark_uploaded(conn: Connection, photo_id: str, job_payload: dict) -> str:
     """The client says the file is in storage: check, and queue it for processing, in the
     caller's transaction. Returns the photo's status afterwards. Safe to call again."""
     row = conn.execute(
-        text("SELECT storage_key, size_bytes, status FROM photos WHERE id = :id FOR UPDATE"),
+        text("SELECT storage_key, size_bytes, status, user_id FROM photos WHERE id = :id FOR UPDATE"),
         {"id": photo_id},
     ).first()
     if row is None:
@@ -255,7 +261,8 @@ def mark_uploaded(conn: Connection, photo_id: str, job_payload: dict) -> str:
     conn.execute(text("UPDATE photos SET status = 'uploaded' WHERE id = :id"), {"id": photo_id})
     # Same transaction as the status change: the job exists exactly when the photo is
     # 'uploaded'. The dedupe key means a retried completion can't queue it twice.
-    jobs.enqueue(conn, "process_photo", {"photo_id": photo_id, **job_payload}, dedupe_key=photo_id)
+    jobs.enqueue(conn, "process_photo", {"photo_id": photo_id, **job_payload}, dedupe_key=photo_id,
+                 priority=limits.job_priority(conn, str(row.user_id)))
     return "uploaded"
 
 
@@ -390,7 +397,8 @@ def _store_processed(
     if regroup_now:
         regroup_trips(conn, user_id)
     else:
-        jobs.enqueue(conn, "regroup_trips", {"user_id": user_id}, dedupe_key=user_id)
+        jobs.enqueue(conn, "regroup_trips", {"user_id": user_id}, dedupe_key=user_id,
+                     priority=limits.job_priority(conn, user_id))
 
 
 def resolve_times(conn: Connection, user_id: str) -> int:

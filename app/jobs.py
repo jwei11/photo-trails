@@ -35,21 +35,23 @@ class Job:
 
 def enqueue(
     conn: Connection, kind: str, payload: dict | None = None, *,
-    dedupe_key: str | None = None, delay: timedelta = timedelta(0),
+    dedupe_key: str | None = None, delay: timedelta = timedelta(0), priority: int = 0,
 ) -> bool:
     """Queue a job, in the caller's transaction. With a dedupe_key, nothing is added if the
-    same job is already waiting. Returns whether a job was added."""
+    same job is already waiting. Lower priorities run first (see app.limits.job_priority).
+    Returns whether a job was added."""
     return bool(
         conn.execute(
             text(
                 """
-                INSERT INTO jobs (kind, payload, dedupe_key, run_after)
-                VALUES (:kind, CAST(:payload AS jsonb), :key, now() + :delay)
+                INSERT INTO jobs (kind, payload, dedupe_key, run_after, priority)
+                VALUES (:kind, CAST(:payload AS jsonb), :key, now() + :delay, :priority)
                 ON CONFLICT (kind, dedupe_key) WHERE status = 'queued' AND dedupe_key IS NOT NULL
                 DO NOTHING
                 """
             ),
-            {"kind": kind, "payload": json.dumps(payload or {}), "key": dedupe_key, "delay": delay},
+            {"kind": kind, "payload": json.dumps(payload or {}), "key": dedupe_key, "delay": delay,
+             "priority": priority},
         ).rowcount
     )
 
@@ -68,7 +70,9 @@ def claim(worker_id: str, kinds: list[str] | None = None) -> Job | None:
                     WHERE ((status = 'queued' AND run_after <= now())
                            OR (status = 'running' AND locked_until < now()))
                       AND (CAST(:kinds AS text[]) IS NULL OR kind = ANY(CAST(:kinds AS text[])))
-                    ORDER BY run_after, id
+                    -- Higher-priority work first, however long lower-priority work has
+                    -- waited: a burst of demo imports never delays an invited user's.
+                    ORDER BY priority, run_after, id
                     -- Lock the row we take; rows other workers have locked are skipped,
                     -- not waited for, so workers never block each other or double-claim.
                     FOR UPDATE SKIP LOCKED

@@ -10,6 +10,7 @@ function renderLogin(at: string) {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<p>Signed in home</p>} />
+      <Route path="/trips/:tripId" element={<p>Trip map</p>} />
     </Routes>,
     at,
   )
@@ -26,8 +27,44 @@ describe('login page', () => {
   it('without Google, says to ask for a link', async () => {
     stubApi({ '/api/auth/me': { user: null, google: false } })
     renderLogin('/login')
-    expect(await screen.findByText(/Ask whoever runs this server/)).toBeTruthy()
+    expect(await screen.findByText(/ask whoever runs this server/)).toBeTruthy()
     expect(screen.queryByRole('link', { name: 'Sign in with Google' })).toBeNull()
+  })
+
+  it('says Google can create an account while sign-ups are open', async () => {
+    stubApi({ '/api/auth/me': { user: null, google: true, signup: true, demo: false } })
+    renderLogin('/login')
+    expect(await screen.findByRole('link', { name: 'Sign in or sign up with Google' })).toBeTruthy()
+    expect(screen.queryByText(/invite-only/)).toBeNull()
+  })
+
+  it('starts a demo account when asked, and only then', async () => {
+    const api = stubApi({ '/api/auth/me': { user: null, google: true, signup: false, demo: true } }, () => ({
+      status: 200,
+      body: { user: { id: 'g', email: 'guest-1@demo.invalid', kind: 'guest', expires_at: null }, trip_id: 't1' },
+    }))
+    renderLogin('/login')
+    const button = await screen.findByRole('button', { name: 'Try the demo' })
+    expect(api.edits()).toEqual([])
+    await userEvent.click(button)
+    expect(api.edits()).toEqual([{ method: 'POST', path: '/api/auth/guest', body: undefined }])
+    expect(await screen.findByText('Trip map')).toBeTruthy()  // straight to the demo trip's map
+  })
+
+  it('says why a demo could not start', async () => {
+    stubApi({ '/api/auth/me': { user: null, google: false, signup: false, demo: true } }, () => ({
+      status: 503, body: { detail: 'The demo is full right now. Try again in a few hours.' },
+    }))
+    renderLogin('/login')
+    await userEvent.click(await screen.findByRole('button', { name: 'Try the demo' }))
+    expect((await screen.findByRole('alert')).textContent).toMatch(/demo is full/)
+  })
+
+  it('offers no demo when the server has none', async () => {
+    stubApi({ '/api/auth/me': { user: null, google: true, signup: false, demo: false } })
+    renderLogin('/login')
+    await screen.findByRole('link', { name: 'Sign in with Google' })
+    expect(screen.queryByRole('button', { name: 'Try the demo' })).toBeNull()
   })
 
   it('shows why a sign-in failed', async () => {

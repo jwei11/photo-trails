@@ -68,13 +68,14 @@ export default function TripSection({ trip, next }: Props) {
             />
           ) : (
             <h2>
-              {tripTitle(trip)} {trip.is_locked && <span className={styles.badge}>edited</span>}
+              <Link className={styles.titleLink} to={`/trips/${trip.id}`}>{tripTitle(trip)}</Link>
+              {' '}{trip.is_locked && <span className={styles.badge}>edited</span>}
             </h2>
           )}
           <div className={styles.muted}>{stats}</div>
         </div>
         <div className={styles.buttons}>
-          <Link className={styles.mapLink} to={`/trips/${trip.id}`}>Map</Link>
+          <Link className={styles.mapLink} to={`/trips/${trip.id}`}>View on map →</Link>
           {!renaming && <button disabled={busy} onClick={() => setRenaming(true)}>Rename</button>}
           {next && (
             <button disabled={busy} title={`Merge "${tripLabel(next)}" into this trip`}

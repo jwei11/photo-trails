@@ -10,6 +10,10 @@
   margin: 0;
 }
 
+.intro {
+  margin: 0;
+}
+
 .google {
   display: inline-block;
   padding: 0.6rem 1rem;
@@ -35,4 +39,12 @@
   margin: 0;
   color: var(--text-muted);
   font-size: 0.9rem;
+}
+
+.demo {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
 }
