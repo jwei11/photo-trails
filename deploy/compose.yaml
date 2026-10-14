@@ -17,6 +17,10 @@ x-app-env: &app-env
   APP_ORIGINS: https://${DOMAIN:?set it in .env}
   GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
   GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  # Accounts that weren't invited (see app/limits.py): live demo guests at once, and
+  # Google sign-ups in total (0 = invite-only).
+  GUESTS_MAX: ${GUESTS_MAX:-50}
+  SIGNUPS_MAX: ${SIGNUPS_MAX:-0}
 
 x-app: &app
   image: ${APP_IMAGE:?set it in .env, e.g. ghcr.io/jwei11/photo-trails:<commit sha>}

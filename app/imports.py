@@ -9,7 +9,7 @@ import logging
 
 from sqlalchemy import Connection, text
 
-from app import objects, storage
+from app import limits, objects, storage
 from app.db import engine
 
 log = logging.getLogger(__name__)
@@ -28,8 +28,9 @@ class InvalidItemState(Exception):
     pass
 
 
-def create_import(user_id: str, files: list[dict]) -> dict:
+def create_import(user_id: str, files: list[dict], kind: str = "invited") -> dict:
     """Register a batch. Files already stored come back as duplicates and need no upload.
+    Raises limits.QuotaExceeded if the new files don't fit the account's quota (`kind`).
 
     The same file twice within one batch is uploaded twice and resolved when the second one
     completes. The browser drops such repeats before sending; marking them duplicates up front
@@ -38,6 +39,8 @@ def create_import(user_id: str, files: list[dict]) -> dict:
     existing = storage.find_by_hashes(user_id, sorted({f["sha256"] for f in files}))
 
     with engine.begin() as conn:
+        storage.lock_writes(conn, user_id)
+        limits.check_upload(conn, user_id, kind, [f["size_bytes"] for f in files if f["sha256"] not in existing])
         import_id = str(
             conn.execute(
                 text("INSERT INTO imports (user_id) VALUES (:user) RETURNING id"), {"user": user_id}

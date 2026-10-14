@@ -14,6 +14,8 @@ and only from what's safe:
   last 7 days are never shown, so a link never says "away right now".
 - Nothing else: no filenames, cameras, EXIF, or exact coordinates, and images only as the
   derivatives, which are re-encoded without metadata. Never the original file.
+- Demo guests' links show only the demo's own photos, never ones the guest uploaded, so a
+  throwaway account can't be used to publish images through this site.
 """
 import secrets
 from datetime import date, datetime, timedelta, timezone
@@ -72,6 +74,7 @@ def _trip_photos(conn: Connection, user_id: str, trip_id: str) -> list:
                 LIMIT 1
             ) city ON p.location IS NOT NULL
             WHERE p.user_id = :user AND p.trip_id = :trip AND p.status = 'ready'
+              AND (p.from_demo OR (SELECT kind FROM users WHERE id = :user) <> 'guest')
             ORDER BY p.shot_at NULLS LAST, p.created_at
             """
         ),

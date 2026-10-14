@@ -1,8 +1,10 @@
 """Who's signed in: users, sessions, sign-in with Google, and one-time sign-in links.
 
-Accounts are invite-only: a user exists only once someone creates it with
-`python -m app.users create <email>`. Signing in proves you own that email, either through
-Google or with a one-time link printed by `python -m app.users login-link <email>`.
+Accounts are invited: created with `python -m app.users create <email>`. Signing in proves
+you own that email, either through Google or with a one-time link printed by
+`python -m app.users login-link <email>`. Two other kinds have limits (see app.limits):
+while sign-ups are open (SIGNUPS_MAX), signing in with Google for the first time creates a
+`signup` account; and "Try the demo" creates a `guest`, which expires (app.guests).
 
 A session is a random token in an HttpOnly cookie, so page scripts can't read it. The
 database keeps only its SHA-256, so the table can't be used to sign in. Signing out deletes
@@ -15,13 +17,14 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
 from fastapi import HTTPException, Request
 from sqlalchemy import text
 
+from app import limits
 from app.config import APP_ORIGINS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 from app.db import engine
 
@@ -40,6 +43,15 @@ OAUTH_LIFETIME = timedelta(minutes=10)
 class User:
     id: str
     email: str
+    kind: str = "invited"  # invited, signup, guest, or demo (see the migration)
+    expires_at: datetime | None = None  # guests only
+
+
+USER_COLUMNS = "u.id, u.email, u.kind, u.expires_at"
+
+
+def _user(row) -> User:
+    return User(str(row.id), row.email, row.kind, row.expires_at)
 
 
 def _hash(token: str) -> bytes:
@@ -57,24 +69,53 @@ class UserExists(Exception):
     pass
 
 
-def create_user(email: str) -> User:
+def create_user(email: str, kind: str = "invited", conn=None) -> User:
+    if conn is None:
+        with engine.begin() as own:
+            return create_user(email, kind, own)
     email = normalize_email(email)
-    with engine.begin() as conn:
-        row = conn.execute(
-            text("INSERT INTO users (email) VALUES (:email) ON CONFLICT (email) DO NOTHING RETURNING id"),
-            {"email": email},
-        ).first()
+    row = conn.execute(
+        text(
+            "INSERT INTO users AS u (email, kind) VALUES (:email, :kind) ON CONFLICT (email) DO NOTHING "
+            f"RETURNING {USER_COLUMNS}"
+        ),
+        {"email": email, "kind": kind},
+    ).first()
     if row is None:
         raise UserExists(email)
-    return User(str(row.id), email)
+    return _user(row)
 
 
 def find_user(email: str) -> User | None:
     with engine.connect() as conn:
         row = conn.execute(
-            text("SELECT id, email FROM users WHERE email = :email"), {"email": normalize_email(email)}
+            text(f"SELECT {USER_COLUMNS} FROM users u WHERE email = :email"), {"email": normalize_email(email)}
         ).first()
-    return User(str(row.id), row.email) if row else None
+    return _user(row) if row else None
+
+
+SIGNUP_LOCK = 2_718_281
+
+
+def signups_open() -> bool:
+    if limits.SIGNUPS_MAX <= 0:
+        return False
+    with engine.connect() as conn:
+        taken = conn.execute(text("SELECT count(*) FROM users WHERE kind = 'signup'")).scalar_one()
+    return taken < limits.SIGNUPS_MAX
+
+
+def sign_up(email: str) -> User:
+    """Someone new signing in with Google: an account, if sign-ups are open and not full.
+    The count and the insert are serialized, so two people can't both take the last place."""
+    if limits.SIGNUPS_MAX <= 0:
+        raise SignInFailed(f"{normalize_email(email)} hasn't been invited.")
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": SIGNUP_LOCK})
+        taken = conn.execute(text("SELECT count(*) FROM users WHERE kind = 'signup'")).scalar_one()
+        if taken >= limits.SIGNUPS_MAX:
+            raise SignInFailed("Sign-ups are full for now. You can still try the demo.")
+        return create_user(email, "signup", conn)
 
 
 # Sessions
@@ -85,9 +126,10 @@ def create_session(user_id: str) -> str:
     token = secrets.token_urlsafe(32)  # 256 random bits: can't be guessed
     with engine.begin() as conn:
         conn.execute(
+            # A guest's session ends when the guest does (least() skips a null expires_at).
             text(
                 "INSERT INTO sessions (token_hash, user_id, expires_at) "
-                "VALUES (:hash, :user, now() + :lifetime)"
+                "SELECT :hash, :user, least(now() + :lifetime, expires_at) FROM users WHERE id = :user"
             ),
             {"hash": _hash(token), "user": user_id, "lifetime": SESSION_LIFETIME},
         )
@@ -100,14 +142,15 @@ def user_for_session(token: str | None) -> User | None:
     with engine.connect() as conn:
         row = conn.execute(
             text(
-                """
-                SELECT u.id, u.email FROM sessions s JOIN users u ON u.id = s.user_id
+                f"""
+                SELECT {USER_COLUMNS} FROM sessions s JOIN users u ON u.id = s.user_id
                 WHERE s.token_hash = :hash AND s.expires_at > now()
+                  AND (u.expires_at IS NULL OR u.expires_at > now())
                 """
             ),
             {"hash": _hash(token)},
         ).first()
-    return User(str(row.id), row.email) if row else None
+    return _user(row) if row else None
 
 
 def end_session(token: str | None) -> None:
@@ -163,12 +206,12 @@ def use_login_link(token: str) -> User | None:
                 UPDATE login_links l SET used_at = now() FROM users u
                 WHERE l.token_hash = :hash AND l.used_at IS NULL AND l.expires_at > now()
                   AND u.id = l.user_id
-                RETURNING u.id, u.email
+                RETURNING u.id, u.email, u.kind, u.expires_at
                 """
             ),
             {"hash": _hash(token)},
         ).first()
-    return User(str(row.id), row.email) if row else None
+    return _user(row) if row else None
 
 
 # Sign in with Google (OpenID Connect, authorization code flow with PKCE)
@@ -237,10 +280,7 @@ def google_finish(request: Request, code: str, state: str, cookie: str | None) -
         raise SignInFailed("Google didn't accept the sign-in. Try again.")
     claims = id_token_claims(response.json()["id_token"])
     check_claims(claims, expected["nonce"])
-    user = find_user(claims["email"])
-    if user is None:
-        raise SignInFailed(f"{claims['email']} hasn't been invited.")
-    return user
+    return find_user(claims["email"]) or sign_up(claims["email"])
 
 
 def id_token_claims(id_token: str) -> dict:

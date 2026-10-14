@@ -9,7 +9,11 @@
 - A reload during an import stops its uploads: the files were only in the page's memory. The import resumes by picking the same files again, matched by hash.
 - M3 has only been tested with synthetic photos. Its "done when" still needs a real trip across a timezone change, in particular to confirm that real iPhone HEIC portraits come out upright (pillow-heif may already apply rotation, and rotating twice would be wrong).
 - The worker downloads each original into memory to process it (as `complete` did before M8). Fine for photos up to the 200 MB limit, but four threads processing large files at once need several hundred MB.
-- There are no upload quotas: an invited user can upload as much as they like. The 200 MB per-file cap limits a single file, not the total.
+- Invited users have no upload quota (only sign-ups and guests do): an invited user can upload as much as they like. The 200 MB per-file cap limits a single file, not the total.
+- Rate-limit counts are kept per API process with a random key, so a restart resets each address's demo count. The cap on live guests still holds.
+- Job priority is strict: while invited users' work keeps arriving, guests' and sign-ups' jobs wait. On a site this size that's a feature; with constant load from invited users it would starve them, and would need ageing.
+- Sign-ups can't be deleted from the app, and a guest who signs up with Google starts an empty account: their demo edits aren't carried over.
+- The demo's own photos are loaded by hand on the server (`python -m app.demo load`), not from a bucket or a seed in the image, so rebuilding the server means loading them again.
 - A revoked share stops working at once, but an image URL it already handed out keeps working until it expires (up to an hour: presigned URLs are signed for an hour).
 - A share still shows times of day and place names, which together can hint at routines. Day numbers keep exact dates out, but not the season.
 - Share views aren't rate-limited. Guessing a 192-bit token isn't feasible, but nothing slows down a script that tries.

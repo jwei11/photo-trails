@@ -54,7 +54,7 @@ def client(migrated_db):
         conn.execute(
             text(
                 "TRUNCATE users, sessions, login_links, shares, photos, camera_clock_offsets, trips, homes, "
-                "imports, import_items, places, admin1_regions, countries, jobs"
+                "imports, import_items, places, admin1_regions, countries, jobs, rate_limit_events"
             )
         )
     with TestClient(app) as c:  # startup creates the test bucket if needed

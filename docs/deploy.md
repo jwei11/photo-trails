@@ -92,6 +92,29 @@ echo '15 3 * * * root /opt/trip-mapper/backup.sh >> /var/log/trip-mapper-backup.
 `ssh root@<ip> /opt/trip-mapper/deploy.sh <commit sha>`, with a SHA CI has published from
 master. Rolling back is the same with an older SHA.
 
+## The demo, and sign-ups
+
+"Try the demo" on the sign-in page appears once a demo trip is loaded. Copy a folder of
+photos to the server and load it (run again with `--replace` to swap in a new set):
+
+```bash
+scp -r <folder> root@<ip>:/opt/trip-mapper/demo-trip     # from the Mac
+chmod -R a+rX /opt/trip-mapper/demo-trip                # the container's user must read it
+cd /opt/trip-mapper
+docker compose run --rm --no-deps -v /opt/trip-mapper/demo-trip:/demo:ro api \
+    python -m app.demo load /demo --name "Death Valley and Sequoia"
+docker compose run --rm --no-deps -T api python -m app.demo status
+```
+
+Loading processes every photo in that one-off container (37 large photos: a few minutes,
+~350 MB of memory at peak). Guests then cost nothing to start: their copies reuse the
+demo's files. `GUESTS_MAX` in `.env` caps live guests.
+
+Sign-ups: set `SIGNUPS_MAX` in `.env` (and run `deploy.sh` again so the API picks it up),
+and in the Google Cloud console move the OAuth app from Testing to **In production**
+(Google Auth Platform → Audience → Publish app). Asking only for `openid email`, it needs
+no review. While it's in Testing, only listed test users can sign in at all.
+
 ## Restoring a backup
 
 ```bash

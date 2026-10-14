@@ -20,7 +20,7 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-from app import cleanup, imports, jobs, storage
+from app import cleanup, guests, imports, jobs, storage
 from app.db import engine
 
 log = logging.getLogger(__name__)
@@ -85,6 +85,9 @@ def regroup_trips(payload: dict) -> None:
 
 
 def sweep(payload: dict) -> None:
+    # Expired guests first: the files they uploaded become orphans, which the orphan sweep
+    # removes once they're older than its cutoff.
+    log.info("expiry %s", guests.delete_expired())
     cleanup.sweep()
     with engine.begin() as conn:
         conn.execute(
