@@ -60,7 +60,7 @@ COAST_TOLERANCE_M = 22_224
 # of 12k 2.3 km, a village of 1,000 630 m. The photo gets the place it's deepest inside,
 # relative to that radius, so a big city counts from further out but a small town still
 # wins right next to it. If no radius reaches the photo, it gets the nearest place.
-# Tried against real spots before choosing: see the README.
+# Tried against real spots before choosing: see docs/decisions.md.
 PLACE_RADIUS_M_PER_SQRT_PERSON = 20
 PLACE_SEARCH_LIMIT_M = 50_000  # the radius of a city of ~6 million; bigger ones are capped
 
